@@ -31,6 +31,8 @@ GW = Path(os.environ.get("GPTWEB_HOME") or (HOME / "data"))
 GW.mkdir(parents=True, exist_ok=True)
 # 场景提示词里告诉模型"项目代码在哪": 设了它就写进前半部分, 模型可以自己去读仓库
 PROMPT_REPO = os.environ.get("GPTWEB_REPO", "").strip()
+# 默认是否打开网页上的"思考"开关; 请求头 X-Thinking: 1/0 可以单次覆盖
+THINKING = os.environ.get("GPTWEB_THINKING", "0").strip().lower() in ("1", "true", "yes", "on")
 KEY_FILE = GW / "key.txt"
 LOG_FILE = GW / "bridge.log"
 
@@ -179,6 +181,8 @@ class ConvoFull(Exception):
 
 SESSIONS: dict[str, dict] = {}
 SESSION_KEEP = 6
+# 一个网页对话最多接多少轮; 超过就主动换新对话, 免得撞上"对话过长"再补救
+SESSION_ROUNDS = int(os.environ.get("GPTWEB_SESSION_ROUNDS", "20"))
 
 
 def _msg_fp(m: dict) -> str:
@@ -203,6 +207,8 @@ def _find_session(key: str, chain: list):
     for s in SESSIONS.values():
         if s["key"] != key:
             continue
+        if s.get("rounds", 0) >= SESSION_ROUNDS:
+            continue
         fps = s["fps"]
         if len(chain) > len(fps) and chain[:len(fps)] == fps:
             if best is None or len(fps) > len(best["fps"]):
@@ -223,8 +229,36 @@ def _save_session(key: str, chain: list, url: str) -> str:
 def _remember(sess: dict | None, key: str, chain: list, url: str) -> None:
     if sess:
         sess["fps"], sess["url"], sess["ts"] = list(chain), url or sess["url"], time.monotonic()
+        sess["rounds"] = sess.get("rounds", 0) + 1
     elif url:
         _save_session(key, chain, url)
+
+
+def _log_request(body: dict, status: str, elapsed: float) -> None:
+    """每次请求追加一行 JSONL, 出问题能回溯: 谁、多大、多久、结果。"""
+    try:
+        msgs = body.get("messages") or []
+        last = ""
+        for m in reversed(msgs):
+            if m.get("role") == "user":
+                c = m.get("content")
+                last = c if isinstance(c, str) else json.dumps(c, ensure_ascii=False)[:300]
+                break
+        rec = {
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "model": body.get("model"),
+            "stream": bool(body.get("stream")),
+            "tools": len(body.get("tools") or []),
+            "msgs": len(msgs),
+            "chars": sum(len(str(m.get("content") or "")) for m in msgs),
+            "elapsed_s": round(elapsed, 1),
+            "status": status,
+            "last_user": last[:300],
+        }
+        with open(GW / "requests.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001 — 记日志失败不能影响主流程
+        pass
 
 
 async def _current_url() -> str:
@@ -317,6 +351,31 @@ async def new_chat(model_slug: str = "auto") -> None:
             return
         await asyncio.sleep(1)
     log("new_chat: 导航 3 次仍未离开旧会话页, 强制继续")
+
+
+async def set_thinking(on: bool) -> str:
+    """输入框里的"思考"开关: 是个 aria-pressed 的按钮, 点一下切一次。
+    刚导航完工具栏可能还没渲染, 所以这里轮询等它出现。返回 'on' / 'off' / 'missing'。"""
+    find = ("(() => { const b = [...document.querySelectorAll('form button')]"
+            ".find(el => (el.innerText || '').trim() === '思考');"
+            " if (!b) return JSON.stringify({st: 'missing'});"
+            " return JSON.stringify({st: b.getAttribute('aria-pressed') === 'true' ? 'on' : 'off'}); })()")
+    click = ("(() => { const b = [...document.querySelectorAll('form button')]"
+             ".find(el => (el.innerText || '').trim() === '思考');"
+             " if (b) b.click(); return JSON.stringify('ok'); })()")
+    for _ in range(20):  # 最多等 10s
+        try:
+            st = (await PAGE.eval(find, 15)).get("st", "missing")
+        except Exception:  # noqa: BLE001
+            st = "missing"
+        if st == "missing":
+            await asyncio.sleep(0.5)
+            continue
+        if (st == "on") == on:
+            return st
+        await PAGE.eval(click, 15)
+        await asyncio.sleep(0.6)
+    return "missing"
 
 
 async def type_and_send(prompt: str) -> None:
@@ -760,13 +819,7 @@ async def health(_: web.Request) -> web.Response:
     })
 
 
-async def completions(req: web.Request) -> web.Response:
-    if req.headers.get("Authorization") != f"Bearer {KEY}":
-        return err("Invalid API key", 401)
-    try:
-        body = await req.json()
-    except Exception:
-        return err("bad json", 400)
+async def _completion(req: web.Request, body: dict, allow_retry: bool = True) -> web.Response:
     messages = body.get("messages") or []
     if not messages:
         return err("messages required", 400)
@@ -777,6 +830,11 @@ async def completions(req: web.Request) -> web.Response:
     if slug not in available and model != "gpt-web":
         return err(f"未知模型 {model}。可用: {', '.join(available)} (gpt-web=auto)", 400)
     tools = body.get("tools") or []
+    # 思考开关: 请求头 X-Thinking 优先, 否则用 env 默认; None = 不碰页面上的开关
+    _hdr = req.headers.get("X-Thinking", "").strip().lower()
+    want_thinking = (True if _hdr in ("1", "true", "on", "yes")
+                     else False if _hdr in ("0", "false", "off", "no")
+                     else (True if THINKING else None))
     cid = "chatcmpl-" + uuid.uuid4().hex[:24]
     started = time.time()
     resp: web.StreamResponse | None = None
@@ -830,6 +888,9 @@ async def completions(req: web.Request) -> web.Response:
                     log(f"REQ: model={model} stream={int(stream)} tools={len(tools)} "
                         f"mode=full msgs={len(messages)} prompt={len(prompt)}ch")
                     await new_chat(slug)
+                    # "思考"开关随新对话重置, 这里按 env / 请求头再设一次
+                    if want_thinking is not None:
+                        log(f"思考模式: {await set_thinking(want_thinking)}")
                     images = extract_images(msgs)
                     if images:
                         log(f"IMG: attach {len(images)} 张(full)")
@@ -957,6 +1018,9 @@ async def completions(req: web.Request) -> web.Response:
             if sess:
                 SESSIONS.pop(sess["sid"], None)
             log(f"CONVO-FULL({slug},{mode}) {time.time()-started:.1f}s")
+            # 非流式且尚未写出任何东西: 让外层丢掉会话、重建对话再跑一次
+            if allow_retry and not stream:
+                raise
             sse_err = ("data: " + json.dumps({"error": {"message": "网页会话已达长度上限, 会话已失效; 重试将自动重建新会话",
                        "type": "gpt_bridge_error", "code": 429}}, ensure_ascii=False) + "\n\ndata: [DONE]\n\n")
             if resp is not None and resp.prepared:
@@ -981,10 +1045,61 @@ async def completions(req: web.Request) -> web.Response:
                 return resp
             return err(f"采集失败: {e}")
 
+async def completions(req: web.Request) -> web.Response:
+    """入口: 鉴权 → 解析 → 跑一次 → 记一行日志; 撞长度上限就换个新对话重跑一次。"""
+    if req.headers.get("Authorization") != f"Bearer {KEY}":
+        return err("Invalid API key", 401)
+    try:
+        body = json.loads(await req.read())
+    except Exception:
+        return err("bad json", 400)
+
+    t0 = time.time()
+    status = "ok"
+    try:
+        resp = await _completion(req, body, allow_retry=True)
+        status = f"http{resp.status}"
+        # 兼容: 有些客户端要求 id 以 chatcmpl- 开头且 usage 存在, 这里不动
+        return resp
+    except ConvoFull:
+        # 会话被顶满: 丢掉所有会话映射, 强制走"新建对话 + 全量重发"
+        SESSIONS.clear()
+        log("CONVO-FULL → 丢会话, 新建对话重跑一次")
+        try:
+            resp = await _completion(req, body, allow_retry=False)
+            status = f"http{resp.status}(rebuilt)"
+            return resp
+        except Exception as e:  # noqa: BLE001
+            status = f"rebuild-fail:{type(e).__name__}"
+            log(f"REBUILD-FAIL: {e!r}")
+            return err("网页会话已达长度上限, 重建对话后仍失败; 请重试或减少上下文", 429)
+    except Exception as e:  # noqa: BLE001
+        status = f"exc:{type(e).__name__}"
+        raise
+    finally:
+        _log_request(body, status, time.time() - t0)
+
+
+async def new_chat_api(req: web.Request) -> web.Response:
+    """显式开一个新对话(不改动调用方的 messages)。agent 的 --new-chat 走这里。"""
+    if req.headers.get("Authorization") != f"Bearer {KEY}":
+        return err("Invalid API key", 401)
+    try:
+        body = json.loads(await req.read() or b"{}")
+    except Exception:
+        body = {}
+    async with BUSY:
+        await new_chat(body.get("model") or "auto")
+        url = await _current_url()
+    log(f"NEW-CHAT → {url}")
+    return web.json_response({"ok": True, "url": url})
+
+
 app = web.Application(client_max_size=10 * 1024 * 1024)
 app.router.add_get("/v1/models", models)
 app.router.add_get("/health", health)
 app.router.add_post("/v1/chat/completions", completions)
+app.router.add_post("/new_chat", new_chat_api)
 
 if __name__ == "__main__":
     log(f"gpt-bridge 启动 :{PORT} key={KEY[:12]}…")

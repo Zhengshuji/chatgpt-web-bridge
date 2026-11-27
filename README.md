@@ -65,6 +65,77 @@ python agent\middleware.py "在 demo 里写个脚本，打印 1..10 的平方，
 结论：有头加开关就够快了，跟无头差 2~4s；无头还多了两个坑——UA 里的 `HeadlessChrome`
 会被 Cloudflare 挑战页拦住（必须伪装 UA），且没有界面不好排错。日常用有头，无人值守再上无头。
 
+## 配置项
+
+桥（`bridge/server.py`，环境变量）：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `GPTWEB_CDP` | `http://127.0.0.1:9225` | 已登录 Chrome 的调试地址 |
+| `GPTWEB_PORT` | `8355` | 本地 OpenAI 兼容端口 |
+| `GPTWEB_HOME` | `bridge/data` | key / 日志 / 会话记录目录 |
+| `GPTWEB_REPO` | 空 | 写进提示词的仓库地址（公开库，模型自己去读） |
+| `GPTWEB_THINKING` | `0` | 默认是否打开网页上的"思考"；请求头 `X-Thinking: 1/0` 可单次覆盖 |
+| `GPTWEB_SESSION_ROUNDS` | `20` | 一个网页对话最多接几轮，超了下次自动换新对话 |
+
+agent（`agent/middleware.py`）：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `AGENT_BRIDGE` | `http://127.0.0.1:8355` | 桥地址 |
+| `AGENT_KEY_FILE` | `bridge/data/key.txt` | API key 文件 |
+| `AGENT_MODEL` | `gpt-web` | 模型 slug（`gpt-web` = auto） |
+| `AGENT_WORKSPACE` | 仓库根 | 工具允许活动的目录，路径越界直接报错 |
+| `AGENT_REMOTE` | 空 | 远端 URL；不设就只本地提交 |
+| `AGENT_AUTO_REPO` | 空 | 没有远端时用 `gh repo create <名字>` 自动建一个 |
+| `AGENT_BRANCH` | `main` | 推送目标分支 |
+| `AGENT_THINKING` | 空 | `1`/`0` 覆盖思考开关 |
+
+命令行：`--model` `--max-rounds` `--no-push` `--push-end-only` `--new-chat` `--thinking 1|0`。
+
+## 常见问题
+
+**换一个 ChatGPT 账号？**
+登录态就是 profile 目录里的 cookie。新账号 = 新目录：
+
+```powershell
+python bridge\login.py --profile profiles\account-b --port 9226   # 会弹 Chrome，人工登录
+$env:GPTWEB_CDP="http://127.0.0.1:9226"; python bridge\server.py  # 桥指向新账号
+```
+
+`login.py --check` 只查状态，会打印账号名和套餐（免费版 / Plus）。想搬登录态就把整个
+profile 目录复制走（`robocopy` 即可，注意先关掉 Chrome）。
+
+**项目一开始没有 git？**
+`agent` 启动时会 `git init`、把分支改成 `main`、本地配一个 `local-agent` 身份；有
+`AGENT_REMOTE` 就挂远端，有 `AGENT_AUTO_REPO` 就用 `gh repo create --push` 现建一个。
+git 完全没装的话，同步会失败但 agent 照跑（只返回"仅本地"）。
+
+**日志在哪？**
+
+| 文件 | 内容 |
+|---|---|
+| `bridge/data/bridge.log` | 桥的运行日志：每次 REQ / OK / RETRY / CONV-FULL |
+| `bridge/data/requests.jsonl` | 每次请求一行：模型、流式、工具数、消息数、耗时、状态、最后一条用户消息（截断 300 字） |
+| `logs/run-*.log` | agent 每次运行的完整终端输出 |
+| `logs/transcript-*.json` | 这次会话的完整 `messages`，可用来复现 |
+
+`bridge/data/` 和 `logs/` 都在 `.gitignore` 里——里面有 key 和会话内容，不进仓库。
+
+**网页对话到上限了怎么办？**
+两道保险：① 会话超过 `GPTWEB_SESSION_ROUNDS`（默认 20）轮，下次请求自动换新对话；
+② 真撞上"对话过长"时，桥丢掉会话映射、新建对话、把全量上下文压缩后重发一次，只有第二次
+还失败才返回 429。远端（DSH 之类）看到 429 重试一次通常就恢复了。
+
+**能让它自动开"思考"吗？**
+能。输入框左侧那个"思考"是 `aria-pressed` 的开关，桥会去找 `form` 里文本为"思考"的按钮并
+点开。`GPTWEB_THINKING=1` 全局默认，请求头 `X-Thinking: 1` 单次强制，agent 用
+`--thinking 1`。开着更慢，但推理题明显好使。
+
+**怎么开新对话？**
+三种：① 换任务（消息指纹链对不上）会自动开新的；② `POST /new_chat`；③
+`python agent\middleware.py --new-chat "任务"`，启动前先让网页那边新建一个对话。
+
 ## 工具库（`agent/tools.py`）
 
 全部落在 **Windows PowerShell 5.1** 上，schema 是 OpenAI function 格式：
