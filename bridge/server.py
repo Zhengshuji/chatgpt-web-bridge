@@ -271,6 +271,72 @@ async def _current_url() -> str:
 
 # ---------------- 网页操作 ----------------
 
+def _last_user_text(body: dict) -> str:
+    for m in reversed(body.get("messages") or []):
+        if m.get("role") == "user":
+            c = m.get("content")
+            return c if isinstance(c, str) else json.dumps(c, ensure_ascii=False)
+    return ""
+
+
+def _fast_answer(body: dict) -> tuple[str, str] | None:
+    """能在本地直接答的请求就别去驱动网页: 既浪费时间又占着单并发锁。
+
+    目前两类:
+      - 会话标题生成(DSH 每开一个新会话问一次, 602 字符却要 40s)
+      - Mnemon 的空闲审查子代理(4 个工具、15K 系统提示, 每次 30~60s, 通常无事可做)
+    """
+    msgs = body.get("messages") or []
+    last = _last_user_text(body)
+    if os.environ.get("GPTWEB_FASTPATH", "1").strip().lower() in ("0", "false", "no", "off"):
+        return None
+
+    if "Generate the session title" in last[:300]:
+        title = "会话"
+        try:
+            i = last.find("[")
+            j = last.rfind("]")
+            arr = json.loads(last[i:j + 1])
+            if isinstance(arr, list) and arr:
+                t = str(arr[0].get("text") or arr[0].get("content") or "").strip()
+                title = t.splitlines()[0][:24] or title
+        except Exception:  # noqa: BLE001 — 解析不出来就用默认名
+            pass
+        return title, "title"
+
+    system = next((str(m.get("content") or "") for m in msgs if m.get("role") == "system"), "")
+    if "idle checkpoint reviewer" in system[:2000]:
+        return "本次检查没有需要变更的候选，跳过。", "reviewer"
+    return None
+
+
+async def _fast_response(req: web.Request, body: dict, text: str, stream: bool,
+                         tag: str) -> web.Response:
+    """把本地生成的答复按 OpenAI 的两种形态返回(与网页那条路径保持一致)。"""
+    model = body.get("model") or "gpt-web"
+    cid = "chatcmpl-" + uuid.uuid4().hex[:24]
+    log(f"FASTPATH[{tag}] {len(text)}ch, 不驱动网页")
+    if not stream:
+        return web.json_response({
+            "id": cid, "object": "chat.completion", "created": int(time.time()),
+            "model": model,
+            "choices": [{"index": 0,
+                         "message": {"role": "assistant", "content": text},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": len(text) // 4,
+                      "total_tokens": len(text) // 4},
+        })
+    resp = web.StreamResponse(headers={"Content-Type": "text/event-stream; charset=utf-8",
+                                       "Cache-Control": "no-cache", "Connection": "keep-alive"})
+    await resp.prepare(req)
+    await resp.write(chunk(cid, model, {"role": "assistant"}).encode())
+    await resp.write(chunk(cid, model, {"content": text}).encode())
+    await resp.write(chunk(cid, model, {}, "stop").encode())
+    await resp.write(b"data: [DONE]\n\n")
+    await resp.write_eof()
+    return resp
+
+
 async def collect_text(base_count: int, base_text: str, deadline: float) -> str:
     """等这一条新回复写完。
 
@@ -534,6 +600,54 @@ async def account_models(max_age: float = 600) -> list[str]:
 
 # ---------------- OpenAI 格式层 ----------------
 
+# DSH 每轮会往消息末尾追加好几坨提醒(工作目录/技能表/时间/MNEMON 记忆快照),
+# 但它们排在真正的任务之后 —— 网页模型看的是"最后说了什么", 于是第一轮经常回一句
+# "请给出具体任务"。这里把这些背景消息挪到前面, 让真正的任务紧贴尾部提醒。
+BOILER_PREFIXES = (
+    "<system-reminder>",
+    "Time sampled while preparing",
+    "[MNEMON]",
+    "MNEMON RUNTIME MEMORY SNAPSHOT",
+    "MNEMON VIEW TOOLS",
+    "[dsh-mnemon",
+)
+
+
+def _is_boiler(m: dict) -> bool:
+    if m.get("role") != "user":
+        return False
+    c = m.get("content")
+    if not isinstance(c, str):
+        return False
+    return c.lstrip().startswith(BOILER_PREFIXES)
+
+
+def _render(m: dict) -> str:
+    role = m.get("role", "user")
+    c = m.get("content", "")
+    if isinstance(c, list):
+        txt, n_img = [], 0
+        for x in c:
+            if not isinstance(x, dict):
+                continue
+            if x.get("type") == "text":
+                txt.append(str(x.get("text", "")))
+            elif x.get("type") in ("image_url", "input_image"):
+                n_img += 1
+        c = "".join(txt) + ("[用户附了图片, 已随消息上传]" if n_img else "")
+    if role == "tool":  # 工具执行结果回传(超大结果保头尾, 网页单条消息有长度上限)
+        name = m.get("name") or m.get("tool_call_id") or "tool"
+        if len(c) > 12000:
+            c = c[:8500] + f"\n...[结果过长, 中段省略 {len(c) - 11500} 字符]...\n" + c[-3000:]
+        return f"[工具 {name} 的执行结果]\n{c}"
+    if role == "assistant" and m.get("tool_calls"):
+        calls = "; ".join(
+            f"{tc.get('function', {}).get('name')}({tc.get('function', {}).get('arguments', '')})"
+            for tc in m["tool_calls"])
+        return f"[assistant 调用了工具: {calls}]"
+    return f"[{role}]\n{c}"
+
+
 def flatten(messages: list, tools: list | None = None) -> str:
     parts = []
     head, tail = ("", "")
@@ -541,31 +655,22 @@ def flatten(messages: list, tools: list | None = None) -> str:
         head, tail = build_tool_protocol(tools)
         if head:
             parts.append(head)
-    for m in messages:
-        role = m.get("role", "user")
-        c = m.get("content", "")
-        if isinstance(c, list):
-            txt, n_img = [], 0
-            for x in c:
-                if not isinstance(x, dict):
-                    continue
-                if x.get("type") == "text":
-                    txt.append(str(x.get("text", "")))
-                elif x.get("type") in ("image_url", "input_image"):
-                    n_img += 1
-            c = "".join(txt) + ("[用户附了图片, 已随消息上传]" if n_img else "")
-        if role == "tool":  # 工具执行结果回传(超大结果保头尾, 网页单条消息有长度上限)
-            name = m.get("name") or m.get("tool_call_id") or "tool"
-            if len(c) > 12000:
-                c = c[:8500] + f"\n...[结果过长, 中段省略 {len(c) - 11500} 字符]...\n" + c[-3000:]
-            parts.append(f"[工具 {name} 的执行结果]\n{c}")
-        elif role == "assistant" and m.get("tool_calls"):
-            calls = "; ".join(
-                f"{tc.get('function', {}).get('name')}({tc.get('function', {}).get('arguments', '')})"
-                for tc in m["tool_calls"])
-            parts.append(f"[assistant 调用了工具: {calls}]")
-        else:
-            parts.append(f"[{role}]\n{c}")
+
+    systems = [m for m in messages if m.get("role") == "system"]
+    boiler = [m for m in messages if _is_boiler(m)]
+    rest = [m for m in messages if m.get("role") != "system" and not _is_boiler(m)]
+
+    for m in systems:
+        parts.append(_render(m))
+    if boiler:
+        parts.append("[会话背景 · 以下是环境与记忆信息，不是本轮任务]\n"
+                     + "\n\n".join(_render(m) for m in boiler))
+    for i, m in enumerate(rest):
+        body = _render(m)
+        if i == len(rest) - 1 and rest and m.get("role") == "user":
+            body = "[以下是本轮要处理的内容]\n" + body
+        parts.append(body)
+
     if tail:
         parts.append(tail)  # 尾部提醒: 利用 recency, 这是对服从率影响最大的一手
     return "\n\n".join(parts)
@@ -892,6 +997,12 @@ async def _completion(req: web.Request, body: dict, allow_retry: bool = True) ->
         return err("messages required", 400)
     model = body.get("model") or "gpt-web"
     stream = bool(body.get("stream"))
+
+    # 能在本地直接答的(会话标题、Mnemon 空闲审查)就别去驱动网页
+    fast = _fast_answer(body)
+    if fast is not None:
+        return await _fast_response(req, body, fast[0], stream, fast[1])
+
     slug = "auto" if model in ("gpt-web", "", "auto") else model
     available = await account_models()
     if slug not in available and model != "gpt-web":

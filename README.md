@@ -90,6 +90,41 @@ schtasks /delete /tn "DSH-GPTWebBridge" /f  # 不要了
 > `powershell -NoProfile -ExecutionPolicy Bypass -File ...` 调用。
 > 另外 `.ps1` 必须存成 **UTF-8 带 BOM**，否则 PS 5.1 按 GBK 解析中文字符串会直接语法报错。
 
+## 新会话不再浪费一轮
+
+**症状**：DSH 每开一个新会话，第一轮模型总是回一句“请给出具体任务或需要检查的项目目标”，
+于是一个回合被白扔。
+
+**根因**（`bridge/data/last_request.json` 里的真实消息顺序）：
+
+```
+[0] system  11924 字
+[1] user    写一个程序，实现0到10的阶乘      ← 真正的任务
+[2] user    <system-reminder> 工作目录/文件策略
+[3] user    <system-reminder> 技能表
+[4] user    Time sampled while preparing turn 1 …
+[5] user    [MNEMON] 检索说明
+[6] user    MNEMON RUNTIME MEMORY SNAPSHOT …
+```
+
+任务在第一条，后面又压了 4 陀背景提醒；网页模型最看“最后说了什么”，于是把提醒当成了本轮
+内容。**不是模型笨，是任务被埋了。**
+
+**解法**：`flatten()` 现在把这些背景块（`<system-reminder>` / `Time sampled` / `[MNEMON]` /
+`MNEMON RUNTIME MEMORY SNAPSHOT` / `[dsh-mnemon]`）挪到前面，标成
+`[会话背景 · 不是本轮任务]`，真正的任务放到最后并标 `[以下是本轮要处理的内容]`，紧贴尾部提醒。
+复现脚本 [bridge/repro_turn1.py](bridge/repro_turn1.py) 用真实消息形状跑，改前回“请给出具体任务”，
+改后第一轮直接给 `glob` 命令。
+
+**顺带砍掉两处纯浪费**（本地直接答，不驱动网页）：
+
+| 请求 | 以前 | 现在 |
+|---|---|---|
+| 会话标题生成（每开新会话一次） | 走网页，~40s | 本地从消息里取名，0.02s |
+| Mnemon 空闲审查子代理 | 走网页，30~60s，还常触发拒答重试 | 直接回“无需变更”，0.01s |
+
+关掉：`GPTWEB_FASTPATH=0`。
+
 ## 配置项
 
 桥（`bridge/server.py`，环境变量）：
