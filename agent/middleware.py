@@ -17,7 +17,8 @@ from pathlib import Path
 
 import requests
 
-from tools import TOOLS, WORKSPACE, execute
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tools import TOOLS, WORKSPACE, execute  # noqa: E402
 
 BRIDGE = os.environ.get("AGENT_BRIDGE", "http://127.0.0.1:8355").rstrip("/")
 KEY_FILE = Path(os.environ.get("AGENT_KEY_FILE") or (WORKSPACE / "bridge" / "data" / "key.txt"))
