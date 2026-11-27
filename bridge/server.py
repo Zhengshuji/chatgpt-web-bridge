@@ -12,6 +12,7 @@ import json
 import os
 import re
 import secrets
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -674,6 +675,69 @@ def _render(m: dict) -> str:
     return f"[{role}]\n{c}"
 
 
+def _flatten_cwd(messages: list) -> str:
+    """从 DSH 塞进来的 system-reminder / system 提示里抠出工作目录。"""
+    pat = re.compile(r'Current working directory:\s*"([^"]+)"')
+    for m in messages:
+        c = m.get("content")
+        if not isinstance(c, str):
+            continue
+        hit = pat.search(c)
+        if hit:
+            return hit.group(1)
+    return ""
+
+
+_GIT_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def _git_info(cwd: str) -> dict:
+    """这个目录是不是 git 仓库、远端是什么、当前分支。带 15s 缓存, 每轮都查也不心疼。"""
+    now = time.monotonic()
+    cached = _GIT_CACHE.get(cwd)
+    if cached and now - cached[0] < 15:
+        return cached[1]
+    info = {"repo": "", "branch": ""}
+    try:
+        r = subprocess.run(["git", "-C", cwd, "remote", "get-url", "origin"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            url = r.stdout.strip()
+            # git@github.com:a/b.git -> https://github.com/a/b
+            m = re.match(r"git@([^:]+):(.+?)(?:\.git)?$", url)
+            info["repo"] = f"https://{m.group(1)}/{m.group(2)}" if m else url
+        b = subprocess.run(["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"],
+                           capture_output=True, text=True, timeout=5)
+        if b.returncode == 0:
+            info["branch"] = b.stdout.strip()
+    except Exception:  # noqa: BLE001 — 没装 git/没权限都当"没有仓库"
+        pass
+    _GIT_CACHE[cwd] = (now, info)
+    return info
+
+
+def _project_rules(messages: list) -> str:
+    """把"这个项目的事实"变成模型不用再问的几条: 目录在哪、有没有仓库、要不要推。
+
+    仓库是可选的: 有 remote 就把公开地址给它(网页那本能直接打开看),
+    没有就明确说别建库别 push —— 免得它去 gh repo list 验证、白烧一轮。
+    """
+    cwd = _flatten_cwd(messages)
+    if not cwd:
+        return ""
+    lines = [f"- 工作目录：{cwd}（就是现在这个）"]
+    if not os.path.isdir(cwd):
+        lines.append("- 这个目录当前不存在或不可读。")
+        return "\n".join(lines)
+    info = _git_info(cwd)
+    if info["repo"]:
+        lines.append(f"- 代码仓库：{info['repo']}（公开，可以直接打开看；分支 {info['branch'] or 'main'}）")
+        lines.append("- 本地每轮结束会自动 commit 并 force push；不要询问是否建库、是否推送，也不要自己改远端。")
+    else:
+        lines.append("- 这个目录没有 git 仓库，也没有远端：不要建仓库、不要 push，直接改文件就行。")
+    return "\n".join(lines)
+
+
 def flatten(messages: list, tools: list | None = None) -> str:
     parts = []
     head, tail = ("", "")
@@ -686,8 +750,9 @@ def flatten(messages: list, tools: list | None = None) -> str:
     boiler = [m for m in messages if _is_boiler(m)]
     rest = [m for m in messages if m.get("role") != "system" and not _is_boiler(m)]
 
-    if POLICY:
-        parts.append("[本地已定死的规则 · 不要询问、不要自行更改]\n" + POLICY)
+    rules = "\n".join(x for x in (POLICY, _project_rules(messages)) if x)
+    if rules:
+        parts.append("[本地已定死的规则 · 不要询问、不要自行更改]\n" + rules)
     for m in systems:
         parts.append(_render(m))
     if boiler:
@@ -738,15 +803,15 @@ def build_tool_protocol(tools: list) -> tuple[str, str]:
                           "tool_calls": [{"name": ex_name, "arguments": ex_args}]},
                          ensure_ascii=False) if ex_name else \
         '{"content": null, "tool_calls": [{"name": "<命令名>", "arguments": {"<参数>": "<值>"}}]}'
-    repo = PROMPT_REPO or "远程的代码仓库"
+    repo = PROMPT_REPO.strip()
     head = (
         "[先说一下我这边的情况]\n"
         "我这台机器没有图形界面，我手上只剩一条命令行通道和一个 JSON 解析器："
         "你把要做的事写成命令交给我，我照着跑，跑完把输出贴回来给你。\n"
         "我看不懂自然语言的操作步骤，只能解析 JSON——你说「把文件改成这样」，我做不到；"
         "你给一条命令，我就能跑。\n"
-        f"项目代码在公开仓库 {repo}，你可以直接打开看，不用问我要内容。\n"
-        "所以每条回复都必须是一个 JSON 对象：从 { 开始、到 } 结束，"
+        + (f"项目代码在公开仓库 {repo}，你可以直接打开看，不用问我要内容。\n" if repo else "")
+        + "所以每条回复都必须是一个 JSON 对象：从 { 开始、到 } 结束，"
         "前后不许有任何字符（不要 ``` 围栏、不要前言、不要解释）。\n"
         "规矩：\n"
         "1. 让你写代码、改文件、跑东西，就直接给 write_file / run_powershell 这类命令。"

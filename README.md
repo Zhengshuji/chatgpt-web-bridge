@@ -125,6 +125,30 @@ schtasks /delete /tn "DSH-GPTWebBridge" /f  # 不要了
 
 关掉：`GPTWEB_FASTPATH=0`。
 
+## 本地规则：仓库是"可选"的
+
+模型不该操心"要不要建库、叫什么、推不推"。桥每轮自己判断，然后把结论写进提示词开头：
+
+```
+[本地已定死的规则 · 不要询问、不要自行更改]
+- 工作目录：D:\Path\others\test（就是现在这个）
+- 代码仓库：https://github.com/Zhengshuji/chatgpt-web-bridge（公开，可以直接打开看；分支 main）
+- 本地每轮结束会自动 commit 并 force push；不要询问是否建库、是否推送，也不要自己改远端。
+```
+
+判断方式：从 DSH 塞进来的 `Current working directory: "..."` 取到目录 → `git remote get-url origin`
+和当前分支（15s 缓存）→ 有 remote 就把**公开地址**直接给模型（它能自己打开看），没有就换成：
+
+```
+- 这个目录没有 git 仓库，也没有远端：不要建仓库、不要 push，直接改文件就行。
+```
+
+所以有的项目需要 GitHub、有的不需要，不用配任何东西；目录不存在时也会明说。要加项目级额外
+规则（比如"测试命令是 pytest"）就设 `GPTWEB_POLICY`，会拼在同一块里。
+
+> 注意别在 `GPTWEB_POLICY` 里写死某个仓库地址——那会在别的项目里变成错误信息。仓库信息交给上面的
+> 自动检测。
+
 ## 配置项
 
 桥（`bridge/server.py`，环境变量）：
