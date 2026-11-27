@@ -955,7 +955,11 @@ ENV_FACTS = _env_facts()
 
 
 def _changed_files(cwd: str, limit: int = 10) -> list[str]:
-    """本地核对"这轮改了哪些文件": 有 git 就看 git status, 没有就看最近 90 分钟改动过的文件。"""
+    """本地核对"这轮改了哪些文件": 先看 git status; 干净(或不是仓库)就按最近 90 分钟改动过的文件。
+
+    git status 只在"还没提交"时有用——agent 模式每轮会自动 commit，那时它就是干净的，
+    所以必须有 mtime 兜底。
+    """
     if not cwd or not os.path.isdir(cwd):
         return []
     try:
@@ -963,7 +967,8 @@ def _changed_files(cwd: str, limit: int = 10) -> list[str]:
                            capture_output=True, text=True, timeout=5)
         if r.returncode == 0:
             rows = [ln for ln in r.stdout.splitlines() if ln.strip()][:limit]
-            return [f"{ln[:2].strip() or '?'} {ln[3:]}" for ln in rows]
+            if rows:
+                return [f"{ln[:2].strip() or '?'} {ln[3:]}" for ln in rows]
     except Exception:  # noqa: BLE001 — 没 git 就走下面的 mtime 分支
         pass
     cutoff = time.time() - 90 * 60

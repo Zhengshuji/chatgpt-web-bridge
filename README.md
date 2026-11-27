@@ -15,14 +15,41 @@
 ## 目录
 
 ```
-bridge/          OpenAI 兼容桥（aiohttp + CDP）
-  server.py        主体：/v1/chat/completions、/v1/models、提示词拼接、JSON 校验与重发
-  probe*.py        CDP 探针：页面状态 / 输入框 / 发送键 / 助手消息定位
-  test_client.py   打本地接口的测试客户端
-agent/
-  tools.py         工具库：PowerShell / 读写文件 / 列目录 / 正则搜索
-  middleware.py    中间件：agent loop（OpenAI messages 结构）+ git 同步
-demo/             agent 跑出来的示例产物
+bridge/               网页 ↔ OpenAI 兼容接口
+  config.py           所有环境变量在这里读一次（Config 对象）
+  codec.py            纯函数：JSON 抽取 / reply 归一 / 参数校验 / 拒答检测
+  server.py           HTTP 面 + CDP + 收发 + 策略
+  login.py            换账号 / 登录态检查
+  service.ps1         守护：拉起 Chrome 与桥（计划任务 DSH-GPTWebBridge 调用）
+  run.ps1             手动启动（带防节流开关，-Headless 可切无头）
+  probe*.py           CDP 探针：页面状态 / 输入框 / 发送键 / 助手消息 / 思考按钮
+  repro_*.py          真实载荷复现：新会话首轮、DSH 形状请求
+  _unit_*.py          12 个单测（多数不需要浏览器）
+  test_client.py      打本地接口的最小客户端
+agent/                网页 ChatGPT 当大脑、PowerShell 当手脚
+  tools.py            工具库：PowerShell / 读写文件 / 列目录 / 正则搜索
+  middleware.py       agent loop（OpenAI messages 结构）+ git 同步
+demo/                 agent 跑出来的示例产物
+pais*.py, diag.py     早期试验脚本（网页自动化雏形），保留但不再维护
+```
+
+## 测试与自检
+
+```powershell
+cd bridge
+python _unit.py            # 解析器
+python _unit_args.py       # 参数校验 + 就地重发
+python _unit_context.py    # 背景去重 / 结果压缩 / 错误分类
+python _unit_tail.py       # 尾部重贴任务 / 改动清单
+python _unit_env.py        # 本机命令路径 / conda 提示
+python _unit_stability.py  # 会话落盘 / 分级超时 / 日志轮转
+# 共 12 个，全部不需要浏览器，改完代码先跑它们
+
+python test_client.py "列一下 demo 目录" --tools          # 打真接口
+python repro_turn1.py                                    # 复现"新会话第一轮"
+python probe.py                                          # 页面状态（DOM 改版时先看这个）
+python _probe_persist2.py 1                              # 会话落盘：第一步
+# 重启桥后再跑：python _probe_persist2.py 2              # 应得到 mode=delta
 ```
 
 ## 快速开始
@@ -290,9 +317,16 @@ schtasks /delete /tn "DSH-GPTWebBridge" /f  # 不要了
 | `GPTWEB_PORT` | `8355` | 本地 OpenAI 兼容端口 |
 | `GPTWEB_HOME` | `bridge/data` | key / 日志 / 会话记录目录 |
 | `GPTWEB_REPO` | 空 | 写进提示词的仓库地址（公开库，模型自己去读） |
+| `GPTWEB_POLICY` | 空 | 项目级额外规则，拼进"本地已定死的规则" |
 | `GPTWEB_THINKING` | `0` | 默认是否打开网页上的"思考"；请求头 `X-Thinking: 1/0` 可单次覆盖 |
 | `GPTWEB_SESSION_ROUNDS` | `20` | 一个网页对话最多接几轮，超了下次自动换新对话 |
-| `GPTWEB_DUMP` | `0` | `1` 时把最近一次请求体落到 `bridge/data/last_request.json`（排查"模型看到了什么"） |
+| `GPTWEB_TOOL_BUDGET` | `6000` | 单条工具结果进提示词的字符预算（超了保头保尾） |
+| `GPTWEB_IDLE_TIMEOUT` | `60` | 页面安静多少秒判失败（生成中放宽 3 倍，回 504） |
+| `GPTWEB_TOTAL_TIMEOUT` | `300` | 单次请求总上限（兜底） |
+| `GPTWEB_LOG_MAX` | `5242880` | 单个日志超过多少字节切成 `.1` |
+| `GPTWEB_FASTPATH` | `1` | 会话标题 / Mnemon 审查在本地直答，不驱动网页 |
+| `GPTWEB_DIFF_SUMMARY` | `1` | 最终回答后附"本轮改动"清单 |
+| `GPTWEB_DUMP` | `0` | `1` 时把最近一次请求体落到 `bridge/data/last_request.json` |
 
 agent（`agent/middleware.py`）：
 
@@ -411,3 +445,14 @@ system → user → assistant(tool_calls) → tool(tool_call_id=...) → assista
 - **DOM 依赖**：ChatGPT 改版会打破选择器，`bridge/probe.py` 是第一排查工具。
 - 单条消息约 24K 字符上限，超了会裁剪。
 - 工具调用是提示词仿真：一次一个调用，无并行，`tool_choice` 强制不支持。
+- 没有做：多账号/并发、附件与图片、真流式 tool_calls、DSH 原生适配器插件
+  （最后一项能拿到完整 ToolSchema / 用量 / DSH 侧压缩与重试，属于下一步）。
+
+## 变更记录（要点）
+
+| 日期 | 内容 |
+|---|---|
+| 11-27 | 收尾：config/codec 拆分、双管线合并、会话落盘、分级超时、日志轮转、错误分类、首轮重贴任务、改动清单、conda 提示 |
+| 11-27 | 本机化改造：CDP 9225、新版 DOM 选择器（`[data-dil-response]` / `aria-label="发送"`）、纯 JSON 协议 + 六类重发 |
+| 11-27 | 常驻化：`service.ps1` + 计划任务，DSH 崩溃不再带走桥与 Chrome |
+| 11-27 | 本地 agent：PowerShell 工具库 + 中间件 + 每轮 git 同步 |
