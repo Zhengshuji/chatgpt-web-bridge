@@ -85,6 +85,7 @@ class Agent:
             log("本目录还不是 git 仓库，先 git init")
             self._git("init")
             self._git("branch", "-M", BRANCH)
+        self._ignore_agent_dir()
         origin = self._git("remote", "get-url", "origin")
         if origin.returncode == 0:
             return
@@ -106,6 +107,17 @@ class Agent:
         for k, v in (("user.name", "local-agent"), ("user.email", "local-agent@localhost")):
             if not self._git("config", "--get", k).stdout.strip():
                 self._git("config", k, v)
+
+    def _ignore_agent_dir(self) -> None:
+        """.agent/ 是桥写的进度文件, 不该进版本库。"""
+        gi = WORKSPACE / ".gitignore"
+        try:
+            text = gi.read_text(encoding="utf-8") if gi.is_file() else ""
+            if ".agent/" not in text:
+                with gi.open("a", encoding="utf-8") as f:
+                    f.write(("\n" if text and not text.endswith("\n") else "") + ".agent/\n")
+        except OSError:
+            pass
 
     def git_sync(self, reason: str) -> str:
         """commit + push；没有改动就跳过。远端只是给网页看的，允许强推。"""

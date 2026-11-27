@@ -340,6 +340,62 @@ async def _fast_response(req: web.Request, body: dict, text: str, stream: bool,
     return resp
 
 
+# ---------------- 进度文件 ----------------
+
+_PROG = {"cwd": "", "t0": 0.0, "round": 0, "phase": "", "event": "", "cmd": "", "conv": ""}
+_PROG_LAST = {"at": 0.0, "phase": "", "event": ""}
+
+
+def progress(cwd: str = "", **kw) -> None:
+    """把当前状态写进 <工作区>/.agent/PROGRESS.md，人一眼能看出"卡在哪一步"。
+
+    DSH 的文件查看器直接能看到；不依赖任何 UI/插件。
+    只有阶段或事件变化、或距上次写超过 2 秒时才落盘，避免每 0.4s 轮询都写文件。
+    """
+    if cwd:
+        _PROG["cwd"] = cwd
+    _PROG.update(kw)
+    target = _PROG["cwd"]
+    if not target or not os.path.isdir(target):
+        return
+    now = time.time()
+    if (now - _PROG_LAST["at"] < 2
+            and _PROG["phase"] == _PROG_LAST["phase"]
+            and _PROG["event"] == _PROG_LAST["event"]):
+        return
+    _PROG_LAST.update(at=now, phase=_PROG["phase"], event=_PROG["event"])
+    elapsed = now - _PROG["t0"] if _PROG["t0"] else 0
+    lines = [
+        "# 桥进度",
+        "",
+        f"- 更新时间：{time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"- 阶段：{_PROG['phase'] or '-'}",
+        f"- 本轮：第 {_PROG['round']} 轮",
+        f"- 已用时：{elapsed:.1f}s",
+        f"- 最近事件：{_PROG['event'] or '-'}",
+        f"- 上一条命令：{_PROG['cmd'] or '-'}",
+        f"- 网页对话：{_PROG['conv'] or '-'}",
+        "",
+    ]
+    try:
+        d = os.path.join(target, ".agent")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "PROGRESS.md"), "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+    except OSError:
+        pass
+
+
+# 幂等守卫: 同一条调用(名字+参数)最多放行 2 次, 第 3 次直接拦下催换思路
+_CALL_COUNTS: dict[str, dict[str, int]] = {}
+
+
+def _call_sig(tc: dict) -> str:
+    fn = tc.get("function", {})
+    raw = f"{fn.get('name', '')}|{fn.get('arguments', '')}"
+    return hashlib.sha1(raw.encode()).hexdigest()[:16]
+
+
 async def collect_text(base_count: int, base_text: str, deadline: float) -> str:
     """等这一条新回复写完。
 
@@ -365,12 +421,14 @@ async def collect_text(base_count: int, base_text: str, deadline: float) -> str:
 
 
 async def collect_json(base_count: int, base_text: str, deadline: float,
-                       valid_names: set[str] | None = None) -> tuple[str, int, str]:
+                       valid_names: set[str] | None = None,
+                       skey: str = "") -> tuple[str, int, str]:
     """收一条回复, 不合格就让模型重来:
     - 不是合法 JSON  -> REPAIRS 轮换
     - 变成"我这边没有执行器"式拒答 -> NUDGES 轮换
     - 合法 JSON 但把活写在了 content 里 -> ACTION_NUDGES 轮换
     - 调用了表里不存在的命令名 -> UNKNOWN_NUDGES 轮换
+    - 同一条调用(名字+参数)第 3 次出现 -> REPEAT_NUDGES 拦下
     最多重发 3 轮。"""
     text = await collect_text(base_count, base_text, deadline)
     for attempt in range(len(REPAIRS)):
@@ -385,11 +443,20 @@ async def collect_json(base_count: int, base_text: str, deadline: float,
         if tcs and valid_names:
             unknown = [tc["function"]["name"] for tc in tcs
                        if tc["function"]["name"] not in valid_names]
-        if not bad_json and not refused and not lazy and not unknown:
+        repeat = 0
+        if tcs and skey:
+            counters = _CALL_COUNTS.setdefault(skey, {})
+            sig = _call_sig(tcs[0])
+            repeat = counters.get(sig, 0) + 1
+            counters[sig] = repeat
+        if not bad_json and not refused and not lazy and not unknown and repeat <= 2:
             break
         if unknown:
             msg = UNKNOWN_NUDGES[attempt % 3]
             tag = f"UNKNOWN({','.join(unknown)[:40]})"
+        elif repeat > 2:
+            msg = REPEAT_NUDGES[attempt % 3]
+            tag = f"REPEAT({tcs[0]['function']['name']}x{repeat})"
         elif refused:
             msg, tag = NUDGES[attempt % 3], "REFUSAL"
         elif lazy:
@@ -397,6 +464,7 @@ async def collect_json(base_count: int, base_text: str, deadline: float,
         else:
             msg, tag = REPAIRS[attempt % 3], "JSON"
         log(f"{tag}-RETRY({attempt + 1}) {text[:70]!r}")
+        progress(phase="让模型重发", event=tag, cmd=tcs[0]["function"]["name"] if tcs else "")
         await type_and_send(msg)
         await asyncio.sleep(1.0)
         snap = await snapshot()
@@ -920,6 +988,13 @@ UNKNOWN_NUDGES = [
     "这个名字不存在。回到命令表：只用表里有的名字，给一条命令。",
 ]
 
+# 同一条调用(名字+参数一模一样)已经发过两次时的说辞。结果不会变, 再发就是浪费。
+REPEAT_NUDGES = [
+    "这条命令你之前已经发过两次了，再来一次结果还是一样。换个思路，或者直接说明卡在哪一步。",
+    "重复调用被拦下了：同样的命令名和参数不解决问题。要么改命令，要么向用户说明卡点。",
+    "别再发同一条命令了。告诉我卡在哪，或者换一种做法。",
+]
+
 
 def _extract_json_object(text: str):
     """从模型回复中取出第一个平衡的 JSON 对象; 容忍 ``` 围栏与前后杂字。"""
@@ -1118,6 +1193,9 @@ async def _completion(req: web.Request, body: dict, allow_retry: bool = True) ->
     skey = _session_key(slug, messages, tools)
     chain = [_msg_fp(m) for m in messages[1:]]
 
+    progress(cwd=_flatten_cwd(messages), t0=started, round=0,
+             phase="排队中", event="收到请求", cmd="", conv="")
+
     async with BUSY:  # 单账号单并发, 排队等待
         prompt = ""
         delta_text = ""
@@ -1152,6 +1230,7 @@ async def _completion(req: web.Request, body: dict, allow_retry: bool = True) ->
                         log(f"IMG: attach {len(images)} 张(delta)")
                         await attach_images(images)
                     await type_and_send(delta_text)
+                    progress(phase="等待网页回复", event="已发送增量", round=_PROG["round"] + 1)
                 else:
                     head_p, tail_p = build_tool_protocol(tools) if tools else ("", "")
                     proto_len = len(head_p) + len(tail_p)
@@ -1178,6 +1257,7 @@ async def _completion(req: web.Request, body: dict, allow_retry: bool = True) ->
                         await attach_images(images)
                     base = await snapshot()
                     await type_and_send(prompt)
+                    progress(phase="等待网页回复", event="已发送整段", round=1)
                 send_err = None
                 break
             except Exception as e:  # noqa: BLE001
@@ -1201,7 +1281,7 @@ async def _completion(req: web.Request, body: dict, allow_retry: bool = True) ->
                 if tools:
                     _names = {t.get("function", {}).get("name") for t in tools}
                     text, base_count, base_text = await collect_json(
-                        base_count, base_text, deadline, _names)
+                        base_count, base_text, deadline, _names, skey)
                 else:
                     text = await collect_text(base_count, base_text, deadline)
                 conv_url = await _current_url()
@@ -1212,6 +1292,9 @@ async def _completion(req: web.Request, body: dict, allow_retry: bool = True) ->
                 content, tcs = (None, None)
                 if tools:
                     content, tcs = parse_reply(text)
+                if tcs:
+                    progress(phase="下发命令", event="tool_calls",
+                             cmd=", ".join(tc["function"]["name"] for tc in tcs))
                 msg: dict = {"role": "assistant"}
                 finish = "stop"
                 if tcs:
@@ -1261,10 +1344,13 @@ async def _completion(req: web.Request, body: dict, allow_retry: bool = True) ->
                 pinger = asyncio.create_task(_keepalive(resp))
                 try:
                     text, base_count, base_text = await collect_json(
-                        base_count, base_text, deadline, _names)
+                        base_count, base_text, deadline, _names, skey)
                 finally:
                     pinger.cancel()
                 content, tcs = parse_reply(text)
+                if tcs:
+                    progress(phase="下发命令", event="tool_calls",
+                             cmd=", ".join(tc["function"]["name"] for tc in tcs))
                 if tcs:
                     await resp.write(chunk(cid, model, {"tool_calls": [
                         {"index": 0, **tc} for tc in tcs]}).encode())
@@ -1375,6 +1461,7 @@ async def completions(req: web.Request) -> web.Response:
         raise
     finally:
         _log_request(body, status, time.time() - t0)
+        progress(phase="完成" if status.startswith("http200") else "结束", event=status)
 
 
 async def new_chat_api(req: web.Request) -> web.Response:

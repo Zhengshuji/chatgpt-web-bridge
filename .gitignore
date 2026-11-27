@@ -24,3 +24,7 @@ venv/
 # agent 运行日志与会话快照
 logs/
 
+
+# 桥写的进度文件
+.agent/
+
