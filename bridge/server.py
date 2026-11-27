@@ -308,10 +308,11 @@ async def collect_json(base_count: int, base_text: str, deadline: float) -> tupl
         content, tcs = parse_reply(text)
         bad_json = obj is None
         refused = not tcs and looks_like_refusal(content or text)
-        if not bad_json and not refused:
+        lazy = (obj is not None) and (not tcs) and looks_like_paste(content or text)
+        if not bad_json and not refused and not lazy:
             break
-        msg = (NUDGES if refused else REPAIRS)[attempt % 3]
-        log(f"{'REFUSAL' if refused else 'JSON'}-RETRY({attempt + 1}) {text[:70]!r}")
+        msg = (NUDGES if refused else ACTION_NUDGES if lazy else REPAIRS)[attempt % 3]
+        log(f"{'REFUSAL' if refused else 'LAZY' if lazy else 'JSON'}-RETRY({attempt + 1}) {text[:70]!r}")
         await type_and_send(msg)
         await asyncio.sleep(1.0)
         snap = await snapshot()
@@ -593,6 +594,11 @@ def build_tool_protocol(tools: list) -> tuple[str, str]:
         f"项目代码在公开仓库 {repo}，你可以直接打开看，不用问我要内容。\n"
         "所以每条回复都必须是一个 JSON 对象：从 { 开始、到 } 结束，"
         "前后不许有任何字符（不要 ``` 围栏、不要前言、不要解释）。\n"
+        "规矩：\n"
+        "1. 让你写代码、改文件、跑东西，就直接给 write_file / run_powershell 这类命令。"
+        "把代码贴在 content 里没有任何用——我不会执行它，文件也不会出现。\n"
+        "2. content 只写给我看的话。没真正跑过的结果不要编造。\n"
+        "3. 第一句就开始给命令，不要回「好的／已了解」这种过渡语。\n"
         "—— 下面是我这台机器上能跑的命令（参数名带 * 为必填）——\n"
         + "\n".join(lines)
         + "\n要跑命令时，整条回复就是：\n"
@@ -606,7 +612,9 @@ def build_tool_protocol(tools: list) -> tuple[str, str]:
         "[回到正常对话]\n"
         "上面这些命令我照单执行，输出会作为下一条消息贴回来。需要看文件、看目录、"
         "跑测试、查状态，就继续给命令，别让我自己去打开什么。\n"
-        "再说一遍：整条回复必须是一个 JSON 对象，前后什么都别加。\n"
+        "再强调一遍最容易犯的错：代码写在 content 里等于没写，必须用 write_file / run_powershell "
+        "把它落地；也不要汇报你没跑过的结果。\n"
+        "整条回复必须是一个 JSON 对象，前后什么都别加。\n"
     )
     return head, tail
 
@@ -648,6 +656,26 @@ NUDGES = [
     "我这边确实能跑，你直接给命令；照上面的 JSON 格式来。",
     "回到格式：整条回复就是一个 JSON 对象，里面放 tool_calls。现在给命令。",
 ]
+
+# 模型把活干在"嘴上"时(只贴代码 / 只回一句"已了解", 却没有任何 tool_calls)的说辞。
+# 这是实测最常见的一种失效: 回复是合法 JSON, 但 content 里是代码, 文件根本没落地。
+ACTION_NUDGES = [
+    "你只把代码写在 content 里，我这边什么都没落地。请用 write_file / run_powershell "
+    "把文件真正写出来，再把结果告诉我。只输出 JSON。",
+    "没有 tool_calls 我什么都干不了。把要做的事变成一条命令放进 tool_calls，只输出 JSON。",
+    "别在 content 里贴代码——贴了不会执行。现在给我一条命令（tool_calls），只输出 JSON。",
+]
+
+# "只说话不动手"的痕迹: 贴了代码块、给了运行结果、或者只是确认收到
+PASTE_RE = re.compile(
+    r"```|^\s*def\s+\w+\s*\(|^\s*(import|from)\s+\w+|运行结果|输出结果|已了解|好的[，,。]|收到[，,。]|明白[，,。]",
+    re.M)
+
+
+def looks_like_paste(text: str) -> bool:
+    """有内容但没有 tool_calls, 且内容像是"把活写在了回答里"。"""
+    return bool(text) and bool(PASTE_RE.search(text[:3000]))
+
 
 REFUSAL_RE = re.compile(
     r"(?:没有|未)(?:连接|接入|提供|可用)[^。\n]{0,30}(?:执行器|接口|工具|环境)"
@@ -864,8 +892,12 @@ async def _completion(req: web.Request, body: dict, allow_retry: bool = True) ->
                     if tools:
                         _, tail_p = build_tool_protocol(tools)
                         delta_text += "\n\n" + tail_p
+                    else:
+                        tail_p = ""
                     if len(delta_text) > PROMPT_CAP:
-                        delta_text = delta_text[:PROMPT_CAP] + "\n[增量超长已截断]"
+                        # 只截中段, 尾部那段"必须给命令"的提醒永远保住
+                        room = max(1000, PROMPT_CAP - len(tail_p) - 60)
+                        delta_text = delta_text[:room] + "\n...[增量过长, 中段截断]...\n" + tail_p
                     log(f"REQ: model={model} stream={int(stream)} tools={len(tools)} "
                         f"mode=delta +{len(delta_msgs)}msg {len(delta_text)}ch")
                     images = extract_images(delta_msgs)
@@ -884,7 +916,9 @@ async def _completion(req: web.Request, body: dict, allow_retry: bool = True) ->
                         prompt = flatten(msgs, tools)
                         shrink += 3000
                     if len(prompt) > PROMPT_CAP:
-                        prompt = prompt[:PROMPT_CAP] + "\n[提示词超长, 已强制截断]"
+                        # 同上: 保住尾部的命令提醒, 只截中段
+                        room = max(1000, PROMPT_CAP - len(tail_p) - 60)
+                        prompt = prompt[:room] + "\n...[提示词过长, 中段截断]...\n" + tail_p
                     log(f"REQ: model={model} stream={int(stream)} tools={len(tools)} "
                         f"mode=full msgs={len(messages)} prompt={len(prompt)}ch")
                     await new_chat(slug)
@@ -1056,6 +1090,12 @@ async def completions(req: web.Request) -> web.Response:
 
     t0 = time.time()
     status = "ok"
+    if os.environ.get("GPTWEB_DUMP", "").strip().lower() in ("1", "true", "yes", "on"):
+        try:
+            (GW / "last_request.json").write_text(
+                json.dumps(body, ensure_ascii=False, indent=1), encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            pass
     try:
         resp = await _completion(req, body, allow_retry=True)
         status = f"http{resp.status}"

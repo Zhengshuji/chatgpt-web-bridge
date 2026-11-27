@@ -77,6 +77,7 @@ python agent\middleware.py "在 demo 里写个脚本，打印 1..10 的平方，
 | `GPTWEB_REPO` | 空 | 写进提示词的仓库地址（公开库，模型自己去读） |
 | `GPTWEB_THINKING` | `0` | 默认是否打开网页上的"思考"；请求头 `X-Thinking: 1/0` 可单次覆盖 |
 | `GPTWEB_SESSION_ROUNDS` | `20` | 一个网页对话最多接几轮，超了下次自动换新对话 |
+| `GPTWEB_DUMP` | `0` | `1` 时把最近一次请求体落到 `bridge/data/last_request.json`（排查"模型看到了什么"） |
 
 agent（`agent/middleware.py`）：
 
@@ -179,7 +180,12 @@ system → user → assistant(tool_calls) → tool(tool_call_id=...) → assista
 
 - **不是合法 JSON** → 三套说辞轮换着让它重发（只强调"只输出 JSON"，不解释原因）；
 - **变成"我没有执行器/无法访问"式拒答** → 三套说辞轮换着把它推回格式（"别管接口，给我命令"）；
+- **只说话不动手**（回复是合法 JSON，但 `content` 里贴着代码/运行结果/一句"已了解"，`tool_calls` 为空）→
+  提示它"代码写在 content 里等于没写，必须用 write_file / run_powershell 落地"；
 - 最多重发 3 次，仍不合格就把原文当 `content` 返回。
+
+对应的提示词里也写死了三条规矩：要落地就给命令、别编造没跑过的结果、第一句就给命令不要"已了解"。
+另外长提示词被截断时只截中段，**尾部那段"必须给命令"的提醒永远保留**（recency 最管用）。
 
 ## 已知限制
 
