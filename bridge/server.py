@@ -33,6 +33,8 @@ GW.mkdir(parents=True, exist_ok=True)
 PROMPT_REPO = os.environ.get("GPTWEB_REPO", "").strip()
 # 默认是否打开网页上的"思考"开关; 请求头 X-Thinking: 1/0 可以单次覆盖
 THINKING = os.environ.get("GPTWEB_THINKING", "0").strip().lower() in ("1", "true", "yes", "on")
+# 本地已经定死的规则(仓库名/分支/是否推送/不许问的东西), 直接写进提示词开头
+POLICY = os.environ.get("GPTWEB_POLICY", "").strip()
 KEY_FILE = GW / "key.txt"
 LOG_FILE = GW / "bridge.log"
 
@@ -622,6 +624,30 @@ def _is_boiler(m: dict) -> bool:
     return c.lstrip().startswith(BOILER_PREFIXES)
 
 
+# 环境级失败(工作区权限/沙箱)不该让模型反复换姿势重试 —— 实测它连试了 4 轮。
+ENV_FAIL_RE = re.compile(
+    r"acl|grantWrite|sandbox|access is denied|拒绝访问|权限不足|workspace grant failed", re.I)
+
+
+def _history_hint(messages: list) -> str:
+    """从对话历史里提炼一句"别再这么干了"的提示, 粘在任务后面。"""
+    tools = [m for m in messages if m.get("role") == "tool"]
+    if not tools:
+        return ""
+    last = str(tools[-1].get("content") or "")
+    # ① 环境级失败: 换个参数重试没用, 该报告
+    if ENV_FAIL_RE.search(last[:800]):
+        return ("【本地提示】上一条工具结果是环境权限错误，不是命令写错了。"
+                "换参数、换命令名重试都不会成功；请直接告诉用户你被权限挡住、卡在哪一步。")
+    # ② 连续两条同样的报错: 别再重试同一招
+    if len(tools) >= 2:
+        prev = str(tools[-2].get("content") or "")
+        if last.strip() and last.strip() == prev.strip() and len(last) > 20:
+            return ("【本地提示】最近两次工具结果一模一样，说明同一条命令重复失败。"
+                    "别再重试同一招，换思路或者直接说明卡点。")
+    return ""
+
+
 def _render(m: dict) -> str:
     role = m.get("role", "user")
     c = m.get("content", "")
@@ -660,6 +686,8 @@ def flatten(messages: list, tools: list | None = None) -> str:
     boiler = [m for m in messages if _is_boiler(m)]
     rest = [m for m in messages if m.get("role") != "system" and not _is_boiler(m)]
 
+    if POLICY:
+        parts.append("[本地已定死的规则 · 不要询问、不要自行更改]\n" + POLICY)
     for m in systems:
         parts.append(_render(m))
     if boiler:
@@ -670,6 +698,10 @@ def flatten(messages: list, tools: list | None = None) -> str:
         if i == len(rest) - 1 and rest and m.get("role") == "user":
             body = "[以下是本轮要处理的内容]\n" + body
         parts.append(body)
+
+    hint = _history_hint(messages)
+    if hint:
+        parts.append(hint)  # 历史里看出来的坑, 紧贴尾部
 
     if tail:
         parts.append(tail)  # 尾部提醒: 利用 recency, 这是对服从率影响最大的一手

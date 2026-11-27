@@ -47,6 +47,11 @@ if (-not (Test-Bridge)) {
     $env:GPTWEB_PORT = "8355"
     if (-not $env:GPTWEB_REPO) { $env:GPTWEB_REPO = "https://github.com/Zhengshuji/chatgpt-web-bridge" }
     $env:GPTWEB_DUMP = "1"
+    if (-not $env:GPTWEB_POLICY) {
+        $env:GPTWEB_POLICY = "仓库已由本地建好：origin=git@github.com:Zhengshuji/chatgpt-web-bridge.git，" +
+            "分支 main；每轮结束本地自动 commit + force push，模型不需要询问仓库名、是否创建、是否推送，" +
+            "也不要自己改远端；工作区就是当前目录，路径已确定。"
+    }
     $py = (Get-Command python -ErrorAction SilentlyContinue)
     if (-not $py) { Write-Host "找不到 python"; exit 1 }
     Start-Process -FilePath $py.Source -ArgumentList "server.py" -WorkingDirectory $here `
