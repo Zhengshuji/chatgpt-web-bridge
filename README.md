@@ -43,6 +43,28 @@ python agent\middleware.py "在 demo 里写个脚本，打印 1..10 的平方，
 桥的 API key 在 `bridge/data/key.txt`（不入库）；每个请求要带
 `Authorization: Bearer <key>`。
 
+## 速度：真正拖慢的是 Chrome 的节流，不是有头/无头
+
+桥靠轮询页面 DOM 收回复，所以**页面被节流 = 变慢**。有头窗口被遮挡/最小化时，Chrome 会
+降低定时器和渲染频率，实测一轮从 ~20s 掉到 45~75s。启动时加这三个开关即可（`run.ps1` 已带）：
+
+```
+--disable-background-timer-throttling
+--disable-backgrounding-occluded-windows
+--disable-renderer-backgrounding
+```
+
+同一请求的实测（同一账号、同一提示词，各 3 次）：
+
+| 模式 | 单轮耗时 |
+|---|---|
+| 有头，被遮挡（默认启动） | 45 / 63 / 76 s |
+| **有头 + 上面三个开关** | **19 / 24 / 26 s** |
+| 无头（`-Headless`，需伪装 UA） | 14 / 19 / 22 s |
+
+结论：有头加开关就够快了，跟无头差 2~4s；无头还多了两个坑——UA 里的 `HeadlessChrome`
+会被 Cloudflare 挑战页拦住（必须伪装 UA），且没有界面不好排错。日常用有头，无人值守再上无头。
+
 ## 工具库（`agent/tools.py`）
 
 全部落在 **Windows PowerShell 5.1** 上，schema 是 OpenAI function 格式：

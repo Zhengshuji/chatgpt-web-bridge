@@ -16,3 +16,7 @@ venv/
 
 # ç¼–è¾‘å™¨
 .vscode/
+
+# ²âËÙÓÃµÄ profile ¸±±¾
+.chrome_headless/
+
