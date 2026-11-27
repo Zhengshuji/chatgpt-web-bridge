@@ -422,7 +422,8 @@ async def collect_text(base_count: int, base_text: str, deadline: float) -> str:
 
 async def collect_json(base_count: int, base_text: str, deadline: float,
                        valid_names: set[str] | None = None,
-                       skey: str = "") -> tuple[str, int, str]:
+                       skey: str = "",
+                       schemas: dict[str, dict] | None = None) -> tuple[str, int, str]:
     """收一条回复, 不合格就让模型重来:
     - 不是合法 JSON  -> REPAIRS 轮换
     - 变成"我这边没有执行器"式拒答 -> NUDGES 轮换
@@ -449,11 +450,19 @@ async def collect_json(base_count: int, base_text: str, deadline: float,
             sig = _call_sig(tcs[0])
             repeat = counters.get(sig, 0) + 1
             counters[sig] = repeat
-        if not bad_json and not refused and not lazy and not unknown and repeat <= 2:
+        args_err = ""
+        if tcs and schemas and not unknown:
+            fn = tcs[0]["function"]
+            args_err = validate_args(schemas.get(fn["name"]), fn.get("arguments"))
+        if (not bad_json and not refused and not lazy and not unknown
+                and repeat <= 2 and not args_err):
             break
         if unknown:
             msg = UNKNOWN_NUDGES[attempt % 3]
             tag = f"UNKNOWN({','.join(unknown)[:40]})"
+        elif args_err:
+            msg = ARGS_NUDGES[attempt % 3].format(err=args_err)
+            tag = f"ARGS({args_err[:40]})"
         elif repeat > 2:
             msg = REPEAT_NUDGES[attempt % 3]
             tag = f"REPEAT({tcs[0]['function']['name']}x{repeat})"
@@ -841,6 +850,16 @@ def flatten(messages: list, tools: list | None = None) -> str:
     return "\n\n".join(parts)
 
 
+def _fmt_params(props: dict, req: set) -> str:
+    """参数表: 必填 `path*:string`，可选 `limit?:number`。给类型, 模型就不太会自己编名字/编类型。"""
+    out = []
+    for k, spec in props.items():
+        t = (spec or {}).get("type") if isinstance(spec, dict) else None
+        t = t if isinstance(t, str) else ""
+        out.append(f"{k}{'*' if k in req else '?'}" + (f":{t}" if t else ""))
+    return ", ".join(out)
+
+
 def build_tool_protocol(tools: list) -> tuple[str, str]:
     """提示词分两半:
     前半(head) = 场景设定: 我只剩一条命令行通道 + 一个 JSON 解析器, 读不懂自然语言,
@@ -857,12 +876,13 @@ def build_tool_protocol(tools: list) -> tuple[str, str]:
         f = t.get("function", {})
         name = f.get("name", "?")
         desc = (f.get("description") or "").strip().replace("\n", " ")[:desc_cap]
-        props = list((f.get("parameters") or {}).get("properties") or {})
-        req = set((f.get("parameters") or {}).get("required") or [])
-        ps = ", ".join(p + ("*" if p in req else "") for p in props)
+        params = f.get("parameters") or {}
+        props = params.get("properties") or {}
+        req = set(params.get("required") or [])
+        ps = _fmt_params(props, req)
         lines.append(f"- {name}({ps}): {desc}")
         if not ex_name and props:
-            ex_name, ex_params = name, props
+            ex_name, ex_params = name, list(props)
     if not lines:
         return "", ""
     ex_args = {k: (r"D:\work\example.txt" if k in ("path", "file", "filename") else f"<{k}>")
@@ -994,6 +1014,46 @@ REPEAT_NUDGES = [
     "重复调用被拦下了：同样的命令名和参数不解决问题。要么改命令，要么向用户说明卡点。",
     "别再发同一条命令了。告诉我卡在哪，或者换一种做法。",
 ]
+
+# 参数过不了 JSON Schema 校验时的说辞({err} 会换成具体原因)。
+ARGS_NUDGES = [
+    "这条命令的参数不对：{err}。请照命令表里的参数名和类型重给一条，只输出 JSON。",
+    "参数校验没过：{err}。不要自己发明参数名，按表里写的来，只输出 JSON。",
+    "参数错误：{err}。改好再发，只输出 JSON。",
+]
+
+_TYPE_MAP = {"string": str, "number": (int, float), "integer": int,
+             "boolean": bool, "array": list, "object": dict}
+
+
+def validate_args(schema: dict | None, args) -> str:
+    """按请求里带的 JSON Schema 校一遍参数, 把能本地看出来的错就地挡住。
+
+    只管两类硬错: 缺必填、类型不符。多说出来的参数只记录不拦截——有些工具容忍额外字段,
+    误拦反而会逼模型重来。
+    """
+    if isinstance(args, str):  # parse_reply 规整后 arguments 是 JSON 字符串
+        try:
+            args = json.loads(args) if args.strip() else {}
+        except json.JSONDecodeError:
+            return "arguments 不是合法 JSON"
+    if not isinstance(args, dict):
+        return "arguments 必须是 JSON 对象"
+    if not isinstance(schema, dict):
+        return ""
+    props = schema.get("properties") or {}
+    missing = [k for k in (schema.get("required") or []) if k not in args]
+    if missing:
+        return "缺少必填参数 " + ", ".join(missing)
+    for k, v in args.items():
+        want = (props.get(k) or {}).get("type") if isinstance(props.get(k), dict) else None
+        if not isinstance(want, str) or want not in _TYPE_MAP:
+            continue
+        if want in ("integer", "number") and isinstance(v, bool):
+            return f"参数 {k} 需要 {want}，不能是布尔值"
+        if not isinstance(v, _TYPE_MAP[want]):
+            return f"参数 {k} 需要 {want}，收到的是 {type(v).__name__}"
+    return ""
 
 
 def _extract_json_object(text: str):
@@ -1280,8 +1340,10 @@ async def _completion(req: web.Request, body: dict, allow_retry: bool = True) ->
             if not stream:
                 if tools:
                     _names = {t.get("function", {}).get("name") for t in tools}
+                    _schemas = {t.get("function", {}).get("name"):
+                                (t.get("function", {}).get("parameters") or {}) for t in tools}
                     text, base_count, base_text = await collect_json(
-                        base_count, base_text, deadline, _names, skey)
+                        base_count, base_text, deadline, _names, skey, _schemas)
                 else:
                     text = await collect_text(base_count, base_text, deadline)
                 conv_url = await _current_url()
@@ -1341,10 +1403,12 @@ async def _completion(req: web.Request, body: dict, allow_retry: bool = True) ->
                 # 收的时候可能几十秒没字节, 客户端(DSH 默认 300s)会按空闲超时断开,
                 # 所以边收边发 SSE 注释帧保活。
                 _names = {t.get("function", {}).get("name") for t in tools}
+                _schemas = {t.get("function", {}).get("name"):
+                            (t.get("function", {}).get("parameters") or {}) for t in tools}
                 pinger = asyncio.create_task(_keepalive(resp))
                 try:
                     text, base_count, base_text = await collect_json(
-                        base_count, base_text, deadline, _names, skey)
+                        base_count, base_text, deadline, _names, skey, _schemas)
                 finally:
                     pinger.cancel()
                 content, tcs = parse_reply(text)
