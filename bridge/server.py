@@ -30,6 +30,10 @@ PORT = int(os.environ.get("GPTWEB_PORT", "8355"))
 HOME = Path(__file__).resolve().parent
 GW = Path(os.environ.get("GPTWEB_HOME") or (HOME / "data"))
 GW.mkdir(parents=True, exist_ok=True)
+SESSIONS_FILE = GW / "sessions.json"
+LOG_MAX_BYTES = int(os.environ.get("GPTWEB_LOG_MAX", str(5 * 1024 * 1024)))
+# 分级超时: 页面安静这么久没有任何新字就判失败, 不再干等到总 deadline
+IDLE_TIMEOUT = float(os.environ.get("GPTWEB_IDLE_TIMEOUT", "60"))
 # 场景提示词里告诉模型"项目代码在哪": 设了它就写进前半部分, 模型可以自己去读仓库
 PROMPT_REPO = os.environ.get("GPTWEB_REPO", "").strip()
 # 默认是否打开网页上的"思考"开关; 请求头 X-Thinking: 1/0 可以单次覆盖
@@ -93,10 +97,24 @@ _models_ts: float = 0.0
 BUSY = asyncio.Lock()  # 单账号同时只能聊一个窗口
 
 
+class UpstreamIdle(Exception):
+    """页面长时间没有产出：比干等到总 deadline 更早失败，交给调用方决定要不要重试。"""
+
+
+def _rotate(path: Path) -> None:
+    """单个日志超过上限就切成 .1，避免跑几个月把盘撑爆。"""
+    try:
+        if LOG_MAX_BYTES > 0 and path.exists() and path.stat().st_size > LOG_MAX_BYTES:
+            os.replace(path, str(path) + ".1")
+    except OSError:
+        pass
+
+
 def log(msg: str) -> None:
     line = f"[{time.strftime('%F %T')}] {msg}"
     print(line, flush=True)
     try:
+        _rotate(LOG_FILE)
         with open(LOG_FILE, "a") as f:
             f.write(line + "\n")
     except OSError:
@@ -219,22 +237,67 @@ def _find_session(key: str, chain: list):
     return best, start
 
 
+def _save_sessions() -> None:
+    """会话映射落盘, 桥重启/计划任务自愈后还能接上原来的网页对话。"""
+    try:
+        tmp = SESSIONS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(list(SESSIONS.values()), ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, SESSIONS_FILE)
+    except OSError:
+        pass
+
+
+def _drop_session(sid: str) -> None:
+    if SESSIONS.pop(sid, None) is not None:
+        _save_sessions()
+
+
+def _clear_sessions() -> None:
+    SESSIONS.clear()
+    _save_sessions()
+
+
+def _load_sessions() -> None:
+    try:
+        rows = json.loads(SESSIONS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    now = time.time()
+    for s in rows if isinstance(rows, list) else []:
+        if not isinstance(s, dict) or not s.get("url") or not s.get("key"):
+            continue
+        # 超过 12 小时的旧会话不再复用: 网页那头大概率已经不是原来那个对话了
+        if now - float(s.get("ts", 0)) > 12 * 3600:
+            continue
+        if len(SESSIONS) >= SESSION_KEEP:
+            break
+        SESSIONS[str(s.get("sid") or s["key"])] = {
+            "sid": s.get("sid"), "key": s["key"], "fps": list(s.get("fps") or []),
+            "url": s["url"], "rounds": int(s.get("rounds", 0)),
+            "ts": float(s.get("ts", now)),
+        }
+
+
 def _save_session(key: str, chain: list, url: str) -> str:
     sid = key + "-" + uuid.uuid4().hex[:6]
     SESSIONS[sid] = {"sid": sid, "key": key, "fps": list(chain),
-                     "url": url, "ts": time.monotonic()}
+                     "url": url, "ts": time.time(), "rounds": 0}
     if len(SESSIONS) > SESSION_KEEP:
         old = min(SESSIONS.values(), key=lambda s: s["ts"])
         SESSIONS.pop(old["sid"], None)
+    _save_sessions()
     return sid
 
 
 def _remember(sess: dict | None, key: str, chain: list, url: str) -> None:
     if sess:
-        sess["fps"], sess["url"], sess["ts"] = list(chain), url or sess["url"], time.monotonic()
+        sess["fps"], sess["url"], sess["ts"] = list(chain), url or sess["url"], time.time()
         sess["rounds"] = sess.get("rounds", 0) + 1
     elif url:
         _save_session(key, chain, url)
+    else:
+        return
+    _save_sessions()
 
 
 def _log_request(body: dict, status: str, elapsed: float) -> None:
@@ -258,7 +321,9 @@ def _log_request(body: dict, status: str, elapsed: float) -> None:
             "status": status,
             "last_user": last[:300],
         }
-        with open(GW / "requests.jsonl", "a", encoding="utf-8") as f:
+        req_log = GW / "requests.jsonl"
+        _rotate(req_log)
+        with open(req_log, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:  # noqa: BLE001 — 记日志失败不能影响主流程
         pass
@@ -401,13 +466,22 @@ async def collect_text(base_count: int, base_text: str, deadline: float) -> str:
 
     判定"是新的"用文本变化而不是消息计数: 长对话里 ChatGPT 会虚拟化旧消息,
     助手消息数量可能不增反减, 靠 count 会一直等到 deadline(实测每轮白等 300s)。
+
+    另外带**分级超时**: 页面安静超过 IDLE_TIMEOUT（生成中放宽 3 倍）就抛 UpstreamIdle,
+    不用干等到总 deadline —— 真卡死时能早 4 分钟报错。
     """
     prev, stable = "", 0
+    last_change = time.monotonic()
     while time.monotonic() < deadline:
         snap = await snapshot(base_count)
         if snap.get("full"):
             raise ConvoFull()
         text, gen = snap.get("text", ""), snap.get("gen", False)
+        if text != prev:
+            last_change = time.monotonic()
+        idle_limit = IDLE_TIMEOUT * (3 if gen else 1)
+        if time.monotonic() - last_change > idle_limit:
+            raise UpstreamIdle(f"页面 {time.monotonic() - last_change:.0f}s 没有新内容")
         fresh = bool(text.strip()) and text != base_text
         if fresh and not gen and text == prev:
             stable += 1
@@ -1375,7 +1449,7 @@ async def _completion(req: web.Request, body: dict, allow_retry: bool = True) ->
             except Exception as e:  # noqa: BLE001
                 send_err = e
                 if sess:
-                    SESSIONS.pop(sess["sid"], None)
+                    _drop_session(sess["sid"])
                 await PAGE.close()
                 if send_attempt == 0:
                     log(f"SEND-RETRY({slug},{mode}): {e!r}")
@@ -1407,7 +1481,7 @@ async def _completion(req: web.Request, body: dict, allow_retry: bool = True) ->
                                "通常几小时后重置; 或改用 mini 档模型(限额独立)。", 429)
                 if is_too_long_text(text):
                     if sess:
-                        SESSIONS.pop(sess["sid"], None)
+                        _drop_session(sess["sid"])
                     log(f"TOO-LONG({slug},{mode}) {time.time()-started:.1f}s")
                     return err("网页说这条消息太长 / 会话已满（不是限流，重试无效）。"
                                "请减少上下文后重发；会话映射已丢弃，下次会自动开新对话。",
@@ -1456,7 +1530,7 @@ async def _completion(req: web.Request, body: dict, allow_retry: bool = True) ->
                                "通常几小时后重置; 或改用 mini 档模型(限额独立)。", 429)
                 if is_too_long_text(psnap.get("text", "")):
                     if sess:
-                        SESSIONS.pop(sess["sid"], None)
+                        _drop_session(sess["sid"])
                     log(f"TOO-LONG({slug},{mode}) pre-stream {time.time()-started:.1f}s")
                     return err("网页说这条消息太长 / 会话已满（不是限流，重试无效）。请减少上下文。",
                                400, "context_length_exceeded")
@@ -1524,7 +1598,7 @@ async def _completion(req: web.Request, body: dict, allow_retry: bool = True) ->
             return resp
         except ConvoFull:
             if sess:
-                SESSIONS.pop(sess["sid"], None)
+                _drop_session(sess["sid"])
             log(f"CONVO-FULL({slug},{mode}) {time.time()-started:.1f}s")
             # 非流式且尚未写出任何东西: 让外层丢掉会话、重建对话再跑一次
             if allow_retry and not stream:
@@ -1542,6 +1616,16 @@ async def _completion(req: web.Request, body: dict, allow_retry: bool = True) ->
         except asyncio.CancelledError:
             log(f"CLIENT-CANCEL({slug},{mode}) {time.time()-started:.1f}s")
             raise
+        except UpstreamIdle as e:
+            log(f"IDLE({slug},{mode}): {e} {time.time()-started:.1f}s")
+            if resp is not None and resp.prepared:
+                try:
+                    await resp.write(err(f"网页长时间无响应: {e}", 504).text.encode())
+                    await resp.write_eof()
+                except Exception:
+                    pass
+                return resp
+            return err(f"网页长时间无响应: {e}（可重试；重复失败请检查页面是否卡住）", 504)
         except Exception as e:  # noqa: BLE001
             await PAGE.close()
             log(f"COLLECT-FAIL({slug},{mode}): {e!r}")
@@ -1577,7 +1661,7 @@ async def completions(req: web.Request) -> web.Response:
         return resp
     except ConvoFull:
         # 会话被顶满: 丢掉所有会话映射, 强制走"新建对话 + 全量重发"
-        SESSIONS.clear()
+        _clear_sessions()
         log("CONVO-FULL → 丢会话, 新建对话重跑一次")
         try:
             resp = await _completion(req, body, allow_retry=False)
@@ -1617,5 +1701,6 @@ app.router.add_post("/v1/chat/completions", completions)
 app.router.add_post("/new_chat", new_chat_api)
 
 if __name__ == "__main__":
-    log(f"gpt-bridge 启动 :{PORT} key={KEY[:12]}…")
+    _load_sessions()
+    log(f"gpt-bridge 启动 :{PORT} key={KEY[:12]}… 续用会话 {len(SESSIONS)} 个")
     web.run_app(app, host="127.0.0.1", port=PORT, print=None)
