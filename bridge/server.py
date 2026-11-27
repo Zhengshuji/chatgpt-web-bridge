@@ -726,6 +726,32 @@ def _history_hint(messages: list) -> str:
     return ""
 
 
+def _squeeze(text: str, budget: int) -> str:
+    """超预算的文本保头保尾、中段省略；顺带把连续重复的行折掉（构建日志/目录列表最常见）。"""
+    if len(text) <= budget:
+        return text
+    lines = text.splitlines()
+    if len(lines) > 40:  # 只有够长才值得折叠重复行
+        collapsed, prev, dup = [], None, 0
+        for ln in lines:
+            if ln == prev:
+                dup += 1
+                continue
+            if dup:
+                collapsed.append(f"…（上一行重复 {dup} 次）")
+                dup = 0
+            collapsed.append(ln)
+            prev = ln
+        if dup:
+            collapsed.append(f"…（上一行重复 {dup} 次）")
+        text = "\n".join(collapsed)
+        if len(text) <= budget:
+            return text
+    head = int(budget * 0.6)
+    tail = max(200, budget - head - 60)
+    return text[:head] + f"\n...[省略中间 {len(text) - head - tail} 字符]...\n" + text[-tail:]
+
+
 def _render(m: dict) -> str:
     role = m.get("role", "user")
     c = m.get("content", "")
@@ -739,11 +765,9 @@ def _render(m: dict) -> str:
             elif x.get("type") in ("image_url", "input_image"):
                 n_img += 1
         c = "".join(txt) + ("[用户附了图片, 已随消息上传]" if n_img else "")
-    if role == "tool":  # 工具执行结果回传(超大结果保头尾, 网页单条消息有长度上限)
+    if role == "tool":  # 工具结果占预算最多, 进提示词前先按预算压
         name = m.get("name") or m.get("tool_call_id") or "tool"
-        if len(c) > 12000:
-            c = c[:8500] + f"\n...[结果过长, 中段省略 {len(c) - 11500} 字符]...\n" + c[-3000:]
-        return f"[工具 {name} 的执行结果]\n{c}"
+        return f"[工具 {name} 的执行结果]\n{_squeeze(c, TOOL_BUDGET)}"
     if role == "assistant" and m.get("tool_calls"):
         calls = "; ".join(
             f"{tc.get('function', {}).get('name')}({tc.get('function', {}).get('arguments', '')})"
@@ -833,8 +857,13 @@ def flatten(messages: list, tools: list | None = None) -> str:
     for m in systems:
         parts.append(_render(m))
     if boiler:
+        # DSH 每轮都会追加同一批背景块（工作目录/技能表/记忆快照），内容经常一字不差；
+        # 同一份只留最后一次，能省下每轮 1.5K～3K。
+        uniq: dict[str, str] = {}
+        for m in boiler:
+            uniq[hashlib.sha1(_render(m).encode()).hexdigest()] = _render(m)
         parts.append("[会话背景 · 以下是环境与记忆信息，不是本轮任务]\n"
-                     + "\n\n".join(_render(m) for m in boiler))
+                     + "\n\n".join(uniq.values()))
     for i, m in enumerate(rest):
         body = _render(m)
         if i == len(rest) - 1 and rest and m.get("role") == "user":
@@ -1133,6 +1162,8 @@ def parse_reply(text: str):
 
 
 PROMPT_CAP = 24000  # 网页单条消息硬上限 ~27K chars(实测), 留 10% 边际; 30K 中文/27K 英文数据见 git 历史
+# 单条工具结果进提示词的预算: 超了就保头保尾、折重复行
+TOOL_BUDGET = int(os.environ.get("GPTWEB_TOOL_BUDGET", "6000"))
 
 
 def truncate_messages(messages: list, budget: int = PROMPT_CAP - 600) -> list:
@@ -1190,8 +1221,20 @@ def chunk(cid: str, model: str, delta: dict, finish=None) -> str:
     return f"data: {json.dumps(d, ensure_ascii=False)}\n\n"
 
 
-def err(message: str, code: int = 500) -> web.Response:
-    return web.json_response({"error": {"message": message, "type": "gpt_bridge_error",
+_ERROR_TYPES = {
+    400: "invalid_request_error",
+    401: "authentication_error",
+    404: "invalid_request_error",
+    429: "rate_limit_exceeded",
+    502: "upstream_error",
+    504: "upstream_timeout",
+}
+
+
+def err(message: str, code: int = 500, type_: str | None = None) -> web.Response:
+    """统一的错误响应：带 OpenAI 风格的 type，客户端(DSH)才能区分限流/上下文/鉴权，而不是一律重试。"""
+    return web.json_response({"error": {"message": message,
+                                        "type": type_ or _ERROR_TYPES.get(code, "bridge_error"),
                                         "code": code}}, status=code)
 
 
@@ -1199,9 +1242,18 @@ LIMIT_RE = re.compile(
     r"hit your (?:usage )?limit|you'?ve reached your|usage (?:cap|limit)|rate limit"
     r"|已达到.{0,6}(上限|限制)|使用额度", re.I)
 
+# 网页自己说"这条太长" / 会话满 —— 属于上下文问题，不是限流，重试没有意义
+TOO_LONG_RE = re.compile(
+    r"maximum length|message you submitted was too long|too long|"
+    r"conversation (?:is )?too long|超过.{0,6}(长度|上限)|内容过长", re.I)
+
 
 def is_limit_text(text: str) -> bool:
     return bool(text) and bool(LIMIT_RE.search(text[:600]))
+
+
+def is_too_long_text(text: str) -> bool:
+    return bool(text) and bool(TOO_LONG_RE.search(text[:600]))
 
 
 async def models(_: web.Request) -> web.Response:
@@ -1330,7 +1382,9 @@ async def _completion(req: web.Request, body: dict, allow_retry: bool = True) ->
                     await asyncio.sleep(3)
         if send_err is not None:
             log(f"SEND-FAIL({slug}): {send_err!r}")
-            return err(f"网页操作失败: {send_err}")
+            if "页面未就绪" in str(send_err) or "登录" in str(send_err):
+                return err(f"网页操作失败: {send_err}（可能需要重新登录：python bridge/login.py）", 401)
+            return err(f"网页操作失败: {send_err}", 502)
         base_count = base.get("count", 0)
         base_text = base.get("text", "")
 
@@ -1351,6 +1405,13 @@ async def _completion(req: web.Request, body: dict, allow_retry: bool = True) ->
                     log(f"LIMIT({slug},{mode}) {time.time()-started:.1f}s")
                     return err("ChatGPT 账号免费额度已用尽(网页返回限流提示)。"
                                "通常几小时后重置; 或改用 mini 档模型(限额独立)。", 429)
+                if is_too_long_text(text):
+                    if sess:
+                        SESSIONS.pop(sess["sid"], None)
+                    log(f"TOO-LONG({slug},{mode}) {time.time()-started:.1f}s")
+                    return err("网页说这条消息太长 / 会话已满（不是限流，重试无效）。"
+                               "请减少上下文后重发；会话映射已丢弃，下次会自动开新对话。",
+                               400, "context_length_exceeded")
                 content, tcs = (None, None)
                 if tools:
                     content, tcs = parse_reply(text)
@@ -1393,6 +1454,12 @@ async def _completion(req: web.Request, body: dict, allow_retry: bool = True) ->
                     log(f"LIMIT({slug},{mode}) pre-stream {time.time()-started:.1f}s")
                     return err("ChatGPT 账号免费额度已用尽(网页返回限流提示)。"
                                "通常几小时后重置; 或改用 mini 档模型(限额独立)。", 429)
+                if is_too_long_text(psnap.get("text", "")):
+                    if sess:
+                        SESSIONS.pop(sess["sid"], None)
+                    log(f"TOO-LONG({slug},{mode}) pre-stream {time.time()-started:.1f}s")
+                    return err("网页说这条消息太长 / 会话已满（不是限流，重试无效）。请减少上下文。",
+                               400, "context_length_exceeded")
                 if psnap.get("text", "").strip():
                     break
                 await asyncio.sleep(0.5)
@@ -1471,7 +1538,7 @@ async def _completion(req: web.Request, body: dict, allow_retry: bool = True) ->
                 except Exception:
                     pass
                 return resp
-            return err("网页会话已达长度上限, 会话已失效; 重试将自动重建新会话", 429)
+            return err("网页会话已达长度上限, 会话已失效; 请减少上下文或开新任务", 400, "context_length_exceeded")
         except asyncio.CancelledError:
             log(f"CLIENT-CANCEL({slug},{mode}) {time.time()-started:.1f}s")
             raise
@@ -1484,7 +1551,7 @@ async def _completion(req: web.Request, body: dict, allow_retry: bool = True) ->
                 except Exception:
                     pass
                 return resp
-            return err(f"采集失败: {e}")
+            return err(f"采集失败: {e}", 502)
 
 async def completions(req: web.Request) -> web.Response:
     """入口: 鉴权 → 解析 → 跑一次 → 记一行日志; 撞长度上限就换个新对话重跑一次。"""
@@ -1519,7 +1586,7 @@ async def completions(req: web.Request) -> web.Response:
         except Exception as e:  # noqa: BLE001
             status = f"rebuild-fail:{type(e).__name__}"
             log(f"REBUILD-FAIL: {e!r}")
-            return err("网页会话已达长度上限, 重建对话后仍失败; 请重试或减少上下文", 429)
+            return err("网页会话已达长度上限, 重建对话后仍失败; 请减少上下文", 400, "context_length_exceeded")
     except Exception as e:  # noqa: BLE001
         status = f"exc:{type(e).__name__}"
         raise
