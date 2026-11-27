@@ -12,6 +12,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import time
 import uuid
@@ -792,6 +793,12 @@ def _is_boiler(m: dict) -> bool:
 ENV_FAIL_RE = re.compile(
     r"acl|grantWrite|sandbox|access is denied|拒绝访问|权限不足|workspace grant failed", re.I)
 
+# conda 这类命令在受限 shell 里常见的失败形态（插件初始化 / 环境损坏）
+CONDA_FAIL_RE = re.compile(
+    r"conda[^\n]{0,40}(plugin|插件|initialize|初始化|failed|错误)"
+    r"|CONDA_NO_PLUGINS|CondaError|conda\.exe[^\n]{0,20}(不是|not recognized)",
+    re.I)
+
 
 def _history_hint(messages: list) -> str:
     """从对话历史里提炼一句"别再这么干了"的提示, 粘在任务后面。"""
@@ -799,7 +806,12 @@ def _history_hint(messages: list) -> str:
     if not tools:
         return ""
     last = str(tools[-1].get("content") or "")
-    # ① 环境级失败: 换个参数重试没用, 该报告
+    # ① conda 这类"要初始化才能用"的命令: 别让它换着花样重试
+    if CONDA_FAIL_RE.search(last[:800]):
+        conda = shutil.which("conda") or "conda.exe 的绝对路径"
+        return (f"【本地提示】conda 在这个 shell 里失败通常是沙箱/插件初始化问题，换写法也没用。"
+                f"直接用绝对路径（{conda}）调用；还不行就枚举 envs 目录找 Python，不必再试 conda。")
+    # ② 环境级失败: 换个参数重试没用, 该报告
     if ENV_FAIL_RE.search(last[:800]):
         return ("【本地提示】上一条工具结果是环境权限错误，不是命令写错了。"
                 "换参数、换命令名重试都不会成功；请直接告诉用户你被权限挡住、卡在哪一步。")
@@ -925,6 +937,23 @@ def _project_rules(messages: list) -> str:
     return "\n".join(lines)
 
 
+_ENV_TOOLS = ("conda", "python", "git", "node", "pwsh", "powershell", "rg")
+
+
+def _env_facts() -> str:
+    """本机常用命令的真实路径。DSH 的 shell 不读 profile，PATH 常常不全——
+    与其让模型试一轮"命令不存在"，不如直接把路径摆在提示词里。"""
+    rows = []
+    for name in _ENV_TOOLS:
+        p = shutil.which(name)
+        if p:
+            rows.append(f"- {name} = {p}")
+    return "\n".join(rows)
+
+
+ENV_FACTS = _env_facts()
+
+
 def _changed_files(cwd: str, limit: int = 10) -> list[str]:
     """本地核对"这轮改了哪些文件": 有 git 就看 git status, 没有就看最近 90 分钟改动过的文件。"""
     if not cwd or not os.path.isdir(cwd):
@@ -981,6 +1010,9 @@ def flatten(messages: list, tools: list | None = None) -> str:
     rules = "\n".join(x for x in (POLICY, _project_rules(messages)) if x)
     if rules:
         parts.append("[本地已定死的规则 · 不要询问、不要自行更改]\n" + rules)
+    if tools and ENV_FACTS:
+        parts.append("[本机环境 · 只读参考]\n" + ENV_FACTS +
+                     "\n（这个 shell 不读 profile，PATH 可能不全；上面这些用绝对路径最稳）")
     for m in systems:
         parts.append(_render(m))
     if boiler:
