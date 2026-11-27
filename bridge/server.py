@@ -262,13 +262,23 @@ async def collect_text(base_count: int, base_text: str, deadline: float) -> str:
 
 
 async def collect_json(base_count: int, base_text: str, deadline: float) -> tuple[str, int, str]:
-    """收一条回复; 不是合法 JSON 就按 REPAIRS 轮换说辞让对方重发, 最多重发 REPAIRS 轮。"""
+    """收一条回复, 不合格就让模型重来:
+    - 不是合法 JSON  -> REPAIRS 轮换
+    - 变成了"我这边没有执行器"式拒答 -> NUDGES 轮换
+    最多重发 REPAIRS 轮。"""
     text = await collect_text(base_count, base_text, deadline)
     for attempt in range(len(REPAIRS)):
-        if _extract_json_object(text) is not None or time.monotonic() >= deadline:
+        if time.monotonic() >= deadline:
             break
-        log(f"JSON-RETRY({attempt + 1}) 非 JSON 回复: {text[:80]!r}")
-        await type_and_send(REPAIRS[attempt])
+        obj = _extract_json_object(text)
+        content, tcs = parse_reply(text)
+        bad_json = obj is None
+        refused = not tcs and looks_like_refusal(content or text)
+        if not bad_json and not refused:
+            break
+        msg = (NUDGES if refused else REPAIRS)[attempt % 3]
+        log(f"{'REFUSAL' if refused else 'JSON'}-RETRY({attempt + 1}) {text[:70]!r}")
+        await type_and_send(msg)
         await asyncio.sleep(1.0)
         snap = await snapshot()
         base_text = snap.get("text", base_text)
@@ -572,6 +582,27 @@ REPAIRS = [
     "解析失败。整条回复必须是一个 JSON 对象，从 { 开始、到 } 结束，前后不留任何字符。",
     "上一条格式不对。再重申一次：我这边只认 JSON，请只输出 JSON。",
 ]
+
+# 模型开始讨论"你有没有执行器"时的说辞。这类拒答是概率性的, 换句话再要一次通常就给命令了。
+NUDGES = [
+    "别管接口的事，按上面的命令表给我一条命令就行。只要 JSON。",
+    "我这边确实能跑，你直接给命令；照上面的 JSON 格式来。",
+    "回到格式：整条回复就是一个 JSON 对象，里面放 tool_calls。现在给命令。",
+]
+
+REFUSAL_RE = re.compile(
+    r"(?:没有|未)(?:连接|接入|提供|可用)[^。\n]{0,30}(?:执行器|接口|工具|环境)"
+    r"|(?:执行器|接口|工具)[^。\n]{0,12}(?:没有|未)(?:连接|接入|提供)"
+    r"|无法[^。\n]{0,10}(?:访问|执行|运行|读取|连接)"
+    r"|不能[^。\n]{0,10}(?:访问|执行|运行)"
+    r"|不会(?:伪造|编造|谎称|声称|假装)"
+    r"|请提供[^。\n]{0,12}(?:执行器|工具|连接|接口)"
+    r"|I (?:can'?t|cannot|do not have)[^.\n]{0,24}(?:access|execute|run|connect)",
+    re.I)
+
+
+def looks_like_refusal(text: str) -> bool:
+    return bool(text) and bool(REFUSAL_RE.search(text[:800]))
 
 
 def _extract_json_object(text: str):
