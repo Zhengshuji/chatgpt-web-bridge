@@ -295,11 +295,14 @@ async def collect_text(base_count: int, base_text: str, deadline: float) -> str:
     return prev or ""
 
 
-async def collect_json(base_count: int, base_text: str, deadline: float) -> tuple[str, int, str]:
+async def collect_json(base_count: int, base_text: str, deadline: float,
+                       valid_names: set[str] | None = None) -> tuple[str, int, str]:
     """收一条回复, 不合格就让模型重来:
     - 不是合法 JSON  -> REPAIRS 轮换
-    - 变成了"我这边没有执行器"式拒答 -> NUDGES 轮换
-    最多重发 REPAIRS 轮。"""
+    - 变成"我这边没有执行器"式拒答 -> NUDGES 轮换
+    - 合法 JSON 但把活写在了 content 里 -> ACTION_NUDGES 轮换
+    - 调用了表里不存在的命令名 -> UNKNOWN_NUDGES 轮换
+    最多重发 3 轮。"""
     text = await collect_text(base_count, base_text, deadline)
     for attempt in range(len(REPAIRS)):
         if time.monotonic() >= deadline:
@@ -309,10 +312,22 @@ async def collect_json(base_count: int, base_text: str, deadline: float) -> tupl
         bad_json = obj is None
         refused = not tcs and looks_like_refusal(content or text)
         lazy = (obj is not None) and (not tcs) and looks_like_paste(content or text)
-        if not bad_json and not refused and not lazy:
+        unknown = []
+        if tcs and valid_names:
+            unknown = [tc["function"]["name"] for tc in tcs
+                       if tc["function"]["name"] not in valid_names]
+        if not bad_json and not refused and not lazy and not unknown:
             break
-        msg = (NUDGES if refused else ACTION_NUDGES if lazy else REPAIRS)[attempt % 3]
-        log(f"{'REFUSAL' if refused else 'LAZY' if lazy else 'JSON'}-RETRY({attempt + 1}) {text[:70]!r}")
+        if unknown:
+            msg = UNKNOWN_NUDGES[attempt % 3]
+            tag = f"UNKNOWN({','.join(unknown)[:40]})"
+        elif refused:
+            msg, tag = NUDGES[attempt % 3], "REFUSAL"
+        elif lazy:
+            msg, tag = ACTION_NUDGES[attempt % 3], "LAZY"
+        else:
+            msg, tag = REPAIRS[attempt % 3], "JSON"
+        log(f"{tag}-RETRY({attempt + 1}) {text[:70]!r}")
         await type_and_send(msg)
         await asyncio.sleep(1.0)
         snap = await snapshot()
@@ -564,12 +579,14 @@ def build_tool_protocol(tools: list) -> tuple[str, str]:
     工具清单压成每行一条, 避免全量 schema 挤爆网页单条长度上限。"""
     lines = []
     ex_name, ex_params = "", []
+    # 工具一多(DSH 一次能塞 90 个), 每个工具的说明压到 60 字, 否则提示词直接撞 24K 上限
+    desc_cap = 60 if len(tools) > 40 else 100
     for t in tools:
         if t.get("type") != "function":
             continue
         f = t.get("function", {})
         name = f.get("name", "?")
-        desc = (f.get("description") or "").strip().replace("\n", " ")[:100]
+        desc = (f.get("description") or "").strip().replace("\n", " ")[:desc_cap]
         props = list((f.get("parameters") or {}).get("properties") or {})
         req = set((f.get("parameters") or {}).get("required") or [])
         ps = ", ".join(p + ("*" if p in req else "") for p in props)
@@ -599,6 +616,8 @@ def build_tool_protocol(tools: list) -> tuple[str, str]:
         "把代码贴在 content 里没有任何用——我不会执行它，文件也不会出现。\n"
         "2. content 只写给我看的话。没真正跑过的结果不要编造。\n"
         "3. 第一句就开始给命令，不要回「好的／已了解」这种过渡语。\n"
+        "4. 命令名和参数名只能用上表里出现的；表里没有的名字一律不存在"
+        "（别用你在别的项目、别的文档里看到的名字）。\n"
         "—— 下面是我这台机器上能跑的命令（参数名带 * 为必填）——\n"
         + "\n".join(lines)
         + "\n要跑命令时，整条回复就是：\n"
@@ -690,6 +709,14 @@ REFUSAL_RE = re.compile(
 
 def looks_like_refusal(text: str) -> bool:
     return bool(text) and bool(REFUSAL_RE.search(text[:800]))
+
+
+# 模型调了表里没有的命令名(实测: 它从别的项目文档里抄了 run_powershell)时的说辞。
+UNKNOWN_NUDGES = [
+    "你用的命令名不在这张表里，我这边没有这个命令，执行不了。只能从上表列出的名字里选一个，重来。",
+    "没有这个命令。请严格用上表的命令名和参数名，只输出 JSON。",
+    "这个名字不存在。回到命令表：只用表里有的名字，给一条命令。",
+]
 
 
 def _extract_json_object(text: str):
@@ -805,6 +832,18 @@ def truncate_messages(messages: list, budget: int = PROMPT_CAP - 600) -> list:
         keep = max(2000, budget - others)
         last["content"] = _content(last)[:keep] + "\n[最新消息因超长被截断]"
     return msgs
+
+
+async def _keepalive(resp: web.StreamResponse, interval: float = 10.0) -> None:
+    """SSE 注释帧保活: 工具模式下收网页回复可能要几十秒没字节, 客户端会按空闲超时断开。"""
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            await resp.write(b": ping\n\n")
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 — 客户端已断开, 结束即可
+        return
 
 
 def chunk(cid: str, model: str, delta: dict, finish=None) -> str:
@@ -952,7 +991,9 @@ async def _completion(req: web.Request, body: dict, allow_retry: bool = True) ->
             deadline = time.monotonic() + 300
             if not stream:
                 if tools:
-                    text, base_count, base_text = await collect_json(base_count, base_text, deadline)
+                    _names = {t.get("function", {}).get("name") for t in tools}
+                    text, base_count, base_text = await collect_json(
+                        base_count, base_text, deadline, _names)
                 else:
                     text = await collect_text(base_count, base_text, deadline)
                 conv_url = await _current_url()
@@ -1005,8 +1046,16 @@ async def _completion(req: web.Request, body: dict, allow_retry: bool = True) ->
             await resp.prepare(req)
             await resp.write(chunk(cid, model, {"role": "assistant"}).encode())
             if tools:
-                # 工具模式: 先收全网页输出(必要时让模型重发 JSON), 再统一转 SSE
-                text, base_count, base_text = await collect_json(base_count, base_text, deadline)
+                # 工具模式: 先收全网页输出(必要时让模型重发 JSON), 再统一转 SSE。
+                # 收的时候可能几十秒没字节, 客户端(DSH 默认 300s)会按空闲超时断开,
+                # 所以边收边发 SSE 注释帧保活。
+                _names = {t.get("function", {}).get("name") for t in tools}
+                pinger = asyncio.create_task(_keepalive(resp))
+                try:
+                    text, base_count, base_text = await collect_json(
+                        base_count, base_text, deadline, _names)
+                finally:
+                    pinger.cancel()
                 content, tcs = parse_reply(text)
                 if tcs:
                     await resp.write(chunk(cid, model, {"tool_calls": [
