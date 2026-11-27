@@ -237,38 +237,44 @@ async def _current_url() -> str:
 
 # ---------------- 网页操作 ----------------
 
-async def collect_text(base_count: int, deadline: float) -> str:
-    """等这一条新回复写完: 新增助手消息出现 + 停止键消失 + 文本连续 3 次不变。"""
+async def collect_text(base_count: int, base_text: str, deadline: float) -> str:
+    """等这一条新回复写完。
+
+    判定"是新的"用文本变化而不是消息计数: 长对话里 ChatGPT 会虚拟化旧消息,
+    助手消息数量可能不增反减, 靠 count 会一直等到 deadline(实测每轮白等 300s)。
+    """
     prev, stable = "", 0
     while time.monotonic() < deadline:
         snap = await snapshot(base_count)
         if snap.get("full"):
             raise ConvoFull()
         text, gen = snap.get("text", ""), snap.get("gen", False)
-        ready = text.strip() and snap.get("count", 0) > base_count
-        if ready and not gen and text == prev:
+        fresh = bool(text.strip()) and text != base_text
+        if fresh and not gen and text == prev:
             stable += 1
-            if stable >= 3:
+            if stable >= 2:
                 break
         else:
             stable = 0
         prev = text
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.4)
     return prev or ""
 
 
-async def collect_json(base_count: int, deadline: float) -> tuple[str, int]:
+async def collect_json(base_count: int, base_text: str, deadline: float) -> tuple[str, int, str]:
     """收一条回复; 不是合法 JSON 就按 REPAIRS 轮换说辞让对方重发, 最多重发 REPAIRS 轮。"""
-    text = await collect_text(base_count, deadline)
+    text = await collect_text(base_count, base_text, deadline)
     for attempt in range(len(REPAIRS)):
         if _extract_json_object(text) is not None or time.monotonic() >= deadline:
             break
         log(f"JSON-RETRY({attempt + 1}) 非 JSON 回复: {text[:80]!r}")
         await type_and_send(REPAIRS[attempt])
         await asyncio.sleep(1.0)
-        base_count = (await snapshot()).get("count", base_count)
-        text = await collect_text(base_count, deadline)
-    return text, base_count
+        snap = await snapshot()
+        base_text = snap.get("text", base_text)
+        base_count = snap.get("count", base_count)
+        text = await collect_text(base_count, base_text, deadline)
+    return text, base_count, base_text
 
 
 async def wait_ready(timeout: float = 90) -> None:
@@ -813,16 +819,16 @@ async def completions(req: web.Request) -> web.Response:
             log(f"SEND-FAIL({slug}): {send_err!r}")
             return err(f"网页操作失败: {send_err}")
         base_count = base.get("count", 0)
+        base_text = base.get("text", "")
 
         try:
-            sent, prev, stable = "", "", 0
             conv_url = ""
             deadline = time.monotonic() + 300
             if not stream:
                 if tools:
-                    text, base_count = await collect_json(base_count, deadline)
+                    text, base_count, base_text = await collect_json(base_count, base_text, deadline)
                 else:
-                    text = await collect_text(base_count, deadline)
+                    text = await collect_text(base_count, base_text, deadline)
                 conv_url = await _current_url()
                 if is_limit_text(text):
                     log(f"LIMIT({slug},{mode}) {time.time()-started:.1f}s")
@@ -874,7 +880,7 @@ async def completions(req: web.Request) -> web.Response:
             await resp.write(chunk(cid, model, {"role": "assistant"}).encode())
             if tools:
                 # 工具模式: 先收全网页输出(必要时让模型重发 JSON), 再统一转 SSE
-                text, base_count = await collect_json(base_count, deadline)
+                text, base_count, base_text = await collect_json(base_count, base_text, deadline)
                 content, tcs = parse_reply(text)
                 if tcs:
                     await resp.write(chunk(cid, model, {"tool_calls": [
@@ -890,24 +896,25 @@ async def completions(req: web.Request) -> web.Response:
                 log(f"OK stream({slug},{mode},{'tools' if tcs else 'chat'}) "
                     f"{len(text)}B {time.time()-started:.1f}s")
             else:
+                sent, prev, stable = "", "", 0
                 while time.monotonic() < deadline:
                     snap = await snapshot(base_count)
                     if snap.get("full"):
                         raise ConvoFull()
                     text, gen = snap.get("text", ""), snap.get("gen", False)
-                    if len(text) > len(sent) and snap.get("count", 0) > base_count:
+                    fresh = bool(text) and text != base_text
+                    if fresh and len(text) > len(sent) and text.startswith(sent):
                         await resp.write(chunk(cid, model,
                                                {"content": text[len(sent):]}).encode())
                         sent = text
-                    ready = text.strip() and snap.get("count", 0) > base_count
-                    if ready and not gen and text == prev:
+                    if fresh and not gen and text == prev:
                         stable += 1
-                        if stable >= 3:
+                        if stable >= 2:
                             break
                     else:
                         stable = 0
                     prev = text
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.4)
                 await resp.write(chunk(cid, model, {}, "stop").encode())
                 log(f"OK stream({slug},{mode}) {len(sent)}B {time.time()-started:.1f}s")
             conv_url = await _current_url()
