@@ -26,8 +26,8 @@ MODEL = os.environ.get("AGENT_MODEL", "gpt-web")
 BRANCH = os.environ.get("AGENT_BRANCH", "main")
 
 SYSTEM = (
-    "你是这台 Windows 机器上的本地编码代理，工作目录是 {root}。\n"
-    "shell 是 Windows PowerShell 5.1（不是 bash）：路径用反斜杠，命令用 PowerShell 写法。\n"
+    "本地执行器的工作目录是 {root}，它的 shell 是 Windows PowerShell 5.1（不是 bash，路径用反斜杠）。\n"
+    "你每轮给出的命令会在那个目录下真实执行，结果作为下一条消息贴回来。\n"
     "改完代码要自己跑一遍验证；遇到报错先读错误再动手。\n"
     "需要了解项目就列目录、读文件、搜关键字，不要凭印象猜。"
 )
