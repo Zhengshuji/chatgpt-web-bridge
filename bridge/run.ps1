@@ -1,4 +1,4 @@
-# 启动桥接服务：先确保 9225 上有已登录的 Chrome，再起 server.py
+﻿# 启动桥接服务：先确保 9225 上有已登录的 Chrome，再起 server.py
 #
 #   pwsh -File bridge\run.ps1              # 有头（默认，好排错）
 #   pwsh -File bridge\run.ps1 -Headless    # 无头（无人值守用）

@@ -34,7 +34,9 @@ demo/             agent 跑出来的示例产物
   --remote-debugging-port=9225 https://chatgpt.com/
 
 # 2) 桥
-pwsh -File bridge\run.ps1        # 或手动 python bridge\server.py
+powershell -NoProfile -ExecutionPolicy Bypass -File bridge\run.ps1   # 手动
+# 常驻（推荐）：交给计划任务，DSH 崩溃不会带走它
+schtasks /run /tn "DSH-GPTWebBridge"
 
 # 3) 让它干活
 python agent\middleware.py "在 demo 里写个脚本，打印 1..10 的平方，跑一遍验证"
@@ -64,6 +66,29 @@ python agent\middleware.py "在 demo 里写个脚本，打印 1..10 的平方，
 
 结论：有头加开关就够快了，跟无头差 2~4s；无头还多了两个坑——UA 里的 `HeadlessChrome`
 会被 Cloudflare 挑战页拦住（必须伪装 UA），且没有界面不好排错。日常用有头，无人值守再上无头。
+
+## 常驻与自愈
+
+DSH 崩溃或重启时，会把它自己拉起的子进程一起带走——桥和 Chrome 如果是在 DSH 的终端里
+`python server.py` 起的，就会跟着死。所以这两样要放在 DSH 的进程树外面。
+
+[bridge/service.ps1](bridge/service.ps1) 干三件事：9225 没活着就拉 Chrome（顺手清掉被杀时留下的
+单例锁）、8355 没活着就拉桥、都活着就直接退出。它被注册成计划任务：
+
+```powershell
+schtasks /query  /tn "DSH-GPTWebBridge"     # 看状态
+schtasks /run    /tn "DSH-GPTWebBridge"     # 立刻拉起/自愈
+schtasks /end    /tn "DSH-GPTWebBridge"
+schtasks /delete /tn "DSH-GPTWebBridge" /f  # 不要了
+```
+
+触发器是"登录时 + 每 10 分钟"，`IgnoreNew` 所以不会叠进程，`ExecutionTimeLimit=PT0S` 所以不会
+到点被杀。任务里的进程父级是 `taskhostw`，与 DSH 无关，DSH 再崩也不影响。脚本的日志在
+`bridge/data/service.out.log` / `service.err.log`。
+
+> 本机只有 Windows PowerShell 5.1（没有 `pwsh` 7），所以脚本一律用
+> `powershell -NoProfile -ExecutionPolicy Bypass -File ...` 调用。
+> 另外 `.ps1` 必须存成 **UTF-8 带 BOM**，否则 PS 5.1 按 GBK 解析中文字符串会直接语法报错。
 
 ## 配置项
 
