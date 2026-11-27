@@ -45,6 +45,23 @@ python agent\middleware.py "在 demo 里写个脚本，打印 1..10 的平方，
 桥的 API key 在 `bridge/data/key.txt`（不入库）；每个请求要带
 `Authorization: Bearer <key>`。
 
+## 代码结构（维护视角）
+
+```
+bridge/
+  config.py     12 个环境变量在这里读一次 → Config 对象；启动日志回显实际配置
+  codec.py      纯函数层：JSON 抽取 / parse_reply / 参数校验 / 拒答与"只说不做"检测
+  server.py     HTTP 面 + CDP + 收发 + 策略（1384 行）
+  login.py      换账号 / 登录态检查
+  probe*.py     CDP 探针（DOM 改版时第一排查工具）
+  repro_*.py    真实载荷复现（新会话第一轮、DSH 形状请求）
+  _unit_*.py    10 个单测，大部分不需要浏览器
+```
+
+改一处就够的地方：提示词、重发话术、参数校验、错误分类。
+以前"非流式/流式"各写一遍的收发逻辑，现在统一在 `receive()`；页面级报错判定统一在
+`page_problem()`；文本→`tool_calls` 的归一统一在 `interpret()`。
+
 ## 速度：真正拖慢的是 Chrome 的节流，不是有头/无头
 
 桥靠轮询页面 DOM 收回复，所以**页面被节流 = 变慢**。有头窗口被遮挡/最小化时，Chrome 会

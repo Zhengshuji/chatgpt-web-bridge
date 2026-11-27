@@ -21,6 +21,9 @@
 
 ## 二、现在乱在哪（都是"层被穿透"）
 
+> **2026-11-27 更新**：下面第 3、4、5 条已经处理掉了（`config.py` / `codec.py` / 合并双管线），
+> 见文末"已完成"一节。留着原文是为了记住当初为什么疼。
+
 1. **`collect_json`(423) 是 L4 的函数，里面却编了六类重发策略（L7）**，还直接调 `type_and_send`
    和 `snapshot`。想加一类新毛病，就得改传输层。
 2. **`flatten`(818) 是纯文本加工（L5），却经 `_project_rules`→`_git_info` 跑 `subprocess`（L1）**，
@@ -35,6 +38,19 @@
    （现在已经是 6 个参数）。
 
 一句话：**分层不是没分，是被"少写一层"省掉了，于是状态和策略都往下渗。**
+
+## 已完成（2026-11-27）
+
+| 改动 | 结果 |
+|---|---|
+| `config.py` | 12 个 `os.environ.get` 收敛成 `Config` 一个对象；`server.py` 里 0 处直接读环境；启动日志回显 `CFG.describe()` |
+| `codec.py` | JSON 抽取 / `parse_reply` / `validate_args` / 两个检测器变成纯函数（142 行），单测不再依赖浏览器；`server.py` 以旧名字 re-export，老测试零改动 |
+| 合并双管线 | `receive()`（统一收包，工具模式自动带 JSON 校验与保活）、`interpret()`（文本→content/tool_calls）、`page_problem()`（限流/太长判定）。原来在非流式与流式分支各写一遍的代码现在只有一份；`_names` 重复 2→0，`progress("下发命令")` 2→1 |
+| 规模 | `server.py` 1504 → 1384 行；十个单测全过；非流式与流式实测都正常 |
+
+仍然没做的：L2/L3/L4 拆成类（`CdpPage` / `SessionRouter` / `Delivery`）、彻底去掉 `PAGE`/`SESSIONS`
+全局。等真要加多账号或写适配器插件时再动。
+
 
 ## 三、目标结构
 
