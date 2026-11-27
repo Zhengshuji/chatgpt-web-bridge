@@ -31,6 +31,8 @@ class Config:
     # 行为
     thinking: bool = field(default_factory=lambda: _flag("GPTWEB_THINKING"))
     fastpath: bool = field(default_factory=lambda: _flag("GPTWEB_FASTPATH", "1"))
+    # 最终回答后附一份"本轮改了哪些文件"的本地核对清单
+    diff_summary: bool = field(default_factory=lambda: _flag("GPTWEB_DIFF_SUMMARY", "1"))
     dump: bool = field(default_factory=lambda: _flag("GPTWEB_DUMP"))
     session_rounds: int = field(default_factory=lambda: int(os.environ.get("GPTWEB_SESSION_ROUNDS", "20")))
     idle_timeout: float = field(default_factory=lambda: float(os.environ.get("GPTWEB_IDLE_TIMEOUT", "60")))

@@ -925,6 +925,47 @@ def _project_rules(messages: list) -> str:
     return "\n".join(lines)
 
 
+def _changed_files(cwd: str, limit: int = 10) -> list[str]:
+    """本地核对"这轮改了哪些文件": 有 git 就看 git status, 没有就看最近 90 分钟改动过的文件。"""
+    if not cwd or not os.path.isdir(cwd):
+        return []
+    try:
+        r = subprocess.run(["git", "-C", cwd, "status", "--porcelain"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            rows = [ln for ln in r.stdout.splitlines() if ln.strip()][:limit]
+            return [f"{ln[:2].strip() or '?'} {ln[3:]}" for ln in rows]
+    except Exception:  # noqa: BLE001 — 没 git 就走下面的 mtime 分支
+        pass
+    cutoff = time.time() - 90 * 60
+    out: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(cwd):
+        dirnames[:] = [d for d in dirnames if d not in
+                       (".git", ".agent", "data", "__pycache__", "node_modules", "chrome_profile")]
+        for fn in filenames:
+            p = os.path.join(dirpath, fn)
+            try:
+                if os.path.getmtime(p) >= cutoff:
+                    out.append(os.path.relpath(p, cwd))
+            except OSError:
+                continue
+            if len(out) >= limit:
+                break
+        if len(out) >= limit:
+            break
+    return [f"改 {x}" for x in out[:limit]]
+
+
+def _decorate(content: str, messages: list) -> str:
+    """在最终回答后面补一段"本地核对"的改动清单——模型经常忘了说自己改了哪些文件。"""
+    if not CFG.diff_summary or not content:
+        return content
+    files = _changed_files(_flatten_cwd(messages))
+    if not files:
+        return content
+    return content.rstrip() + "\n\n---\n【本地核对 · 本轮改动】\n" + "\n".join(f"- {x}" for x in files)
+
+
 def flatten(messages: list, tools: list | None = None) -> str:
     parts = []
     head, tail = ("", "")
@@ -962,6 +1003,14 @@ def flatten(messages: list, tools: list | None = None) -> str:
 
     if tail:
         parts.append(tail)  # 尾部提醒: 利用 recency, 这是对服从率影响最大的一手
+
+    # 最后再原样贴一遍本轮任务 —— DSH 会把任务夹在一堆提醒中间，模型经常回一句
+    # "请指定本轮要执行的具体任务"。放在整段提示词的最末，就是它最后看到的东西。
+    if rest and rest[-1].get("role") == "user":
+        task_text = _render(rest[-1])
+        task_text = task_text.split("\n", 1)[1] if "\n" in task_text else task_text
+        if task_text.strip():
+            parts.append("[本轮任务 · 直接动手，不要反问]\n" + task_text.strip()[:1500])
     return "\n\n".join(parts)
 
 
@@ -1375,6 +1424,8 @@ async def _completion(req: web.Request, body: dict, allow_retry: bool = True) ->
                 if problem is not None:
                     return problem
                 content, tcs = interpret(text, tools)
+                if not tcs:
+                    content = _decorate(text if content is None else content, messages)
                 msg: dict = {"role": "assistant"}
                 finish = "stop"
                 if tcs:
@@ -1427,7 +1478,7 @@ async def _completion(req: web.Request, body: dict, allow_retry: bool = True) ->
                         {"index": 0, **tc} for tc in tcs]}).encode())
                     await resp.write(chunk(cid, model, {}, "tool_calls").encode())
                 else:
-                    body = text if content is None else content
+                    body = _decorate(text if content is None else content, messages)
                     for i in range(0, len(body), 64):
                         await resp.write(chunk(cid, model,
                                                {"content": body[i:i + 64]}).encode())
