@@ -60,8 +60,9 @@ python _probe_persist2.py 1                              # 会话落盘：第一
   --user-data-dir="D:\Path\others\test\chrome_profile" `
   --remote-debugging-port=9225 https://chatgpt.com/
 
-# 2) 桥
-powershell -NoProfile -ExecutionPolicy Bypass -File bridge\run.ps1   # 手动
+# 2) 桥（默认无头浏览器；想看到窗口就加 -Headed）
+powershell -NoProfile -ExecutionPolicy Bypass -File bridge\run.ps1            # 无头
+powershell -NoProfile -ExecutionPolicy Bypass -File bridge\run.ps1 -Headed    # 有头（调试）
 # 常驻（推荐）：交给计划任务，DSH 崩溃不会带走它
 schtasks /run /tn "DSH-GPTWebBridge"
 
@@ -108,8 +109,10 @@ bridge/
 | **有头 + 上面三个开关** | **19 / 24 / 26 s** |
 | 无头（`-Headless`，需伪装 UA） | 14 / 19 / 22 s |
 
-结论：有头加开关就够快了，跟无头差 2~4s；无头还多了两个坑——UA 里的 `HeadlessChrome`
-会被 Cloudflare 挑战页拦住（必须伪装 UA），且没有界面不好排错。日常用有头，无人值守再上无头。
+结论：**默认用无头**（2026-11-28 起 `service.ps1` / `run.ps1` 的默认值就是 `--headless=new`，
+并自动伪装 UA）；要看页面、调 DOM 时加 `-Headed`，或在计划任务环境里设 `GPTWEB_HEADED=1`。
+有头 + 上面三个开关跟无头只差 2~4s，但无头不用管窗口被遮挡/最小化，长期跑更省心；
+代价是出问题时看不到界面，只能靠 `probe.py`。
 
 ## 常驻与自愈
 
@@ -117,7 +120,8 @@ DSH 崩溃或重启时，会把它自己拉起的子进程一起带走——桥�
 `python server.py` 起的，就会跟着死。所以这两样要放在 DSH 的进程树外面。
 
 [bridge/service.ps1](bridge/service.ps1) 干三件事：9225 没活着就拉 Chrome（顺手清掉被杀时留下的
-单例锁）、8355 没活着就拉桥、都活着就直接退出。它被注册成计划任务：
+单例锁；**默认无头**，`-Headed` 或 `GPTWEB_HEADED=1` 可切有头）、8355 没活着就拉桥、都活着就直接退出。
+浏览器参数由 [bridge/browser.ps1](bridge/browser.ps1) 统一提供（两个脚本 dot-source 它，免得改一处忘一处）。它被注册成计划任务：
 
 ```powershell
 schtasks /query  /tn "DSH-GPTWebBridge"     # 看状态
