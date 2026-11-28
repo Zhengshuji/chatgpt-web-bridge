@@ -119,20 +119,31 @@ bridge/
 DSH 崩溃或重启时，会把它自己拉起的子进程一起带走——桥和 Chrome 如果是在 DSH 的终端里
 `python server.py` 起的，就会跟着死。所以这两样要放在 DSH 的进程树外面。
 
-[bridge/service.ps1](bridge/service.ps1) 干三件事：9225 没活着就拉 Chrome（顺手清掉被杀时留下的
-单例锁；**默认无头**，`-Headed` 或 `GPTWEB_HEADED=1` 可切有头）、8355 没活着就拉桥、都活着就直接退出。
-浏览器参数由 [bridge/browser.ps1](bridge/browser.ps1) 统一提供（两个脚本 dot-source 它，免得改一处忘一处）。它被注册成计划任务：
+[bridge/service.ps1](bridge/service.ps1) 是个**常驻监督进程**：拉起 Chrome（默认无头，`-Headed` 或
+`GPTWEB_HEADED=1` 切有头）和桥，然后每 60 秒巡检一次，缺什么补什么；日志写
+`bridge/data/service.log`（每 30 分钟一条心跳，重启时才多写几行）。浏览器参数由
+[bridge/browser.ps1](bridge/browser.ps1) 统一提供（两个脚本 dot-source 它，免得改一处忘一处）。
+
+计划的动作是 `wscript.exe bridge\service.vbs`——VBS 把 powershell 以**隐藏窗口**启动，并**一直等它**：
 
 ```powershell
-schtasks /query  /tn "DSH-GPTWebBridge"     # 看状态
+schtasks /query  /tn "DSH-GPTWebBridge"     # 看状态：常驻时应该是 Running
 schtasks /run    /tn "DSH-GPTWebBridge"     # 立刻拉起/自愈
-schtasks /end    /tn "DSH-GPTWebBridge"
+schtasks /end    /tn "DSH-GPTWebBridge"     # 停掉监督进程（组件随后也会被带走）
 schtasks /delete /tn "DSH-GPTWebBridge" /f  # 不要了
 ```
 
-触发器是"登录时 + 每 10 分钟"，`IgnoreNew` 所以不会叠进程，`ExecutionTimeLimit=PT0S` 所以不会
-到点被杀。任务里的进程父级是 `taskhostw`，与 DSH 无关，DSH 再崩也不影响。脚本的日志在
-`bridge/data/service.out.log` / `service.err.log`。
+三个坑，都是实测踩出来的：
+
+1. **任务动作一退出，Windows 就回收整棵进程树**。所以 VBS 必须 `Run(..., 0, True)`（等待），
+   让任务一直处于 `Running`；否则监督进程刚起来就被杀，表现就是"每 10 分钟弹一次、起了又没"。
+2. **隐藏窗口要靠 `wscript.exe`**，不是 `powershell -WindowStyle Hidden`——后者在计划任务里仍会闪黑框。
+3. 触发器保留"登录时 + 每 10 分钟"，配合 `MultipleInstancesPolicy=IgnoreNew`：常驻时新触发被忽略，
+   真挂了 10 分钟内自动补起来。`ExecutionTimeLimit=PT0S` 保证常驻进程不会到点被杀。
+
+> 本机只有 Windows PowerShell 5.1（没有 `pwsh` 7），所以脚本一律用
+> `powershell -NoProfile -ExecutionPolicy Bypass -File ...` 调用。
+> 另外 `.ps1` 必须存成 **UTF-8 带 BOM**，否则 PS 5.1 按 GBK 解析中文字符串会直接语法报错。
 
 > 本机只有 Windows PowerShell 5.1（没有 `pwsh` 7），所以脚本一律用
 > `powershell -NoProfile -ExecutionPolicy Bypass -File ...` 调用。
